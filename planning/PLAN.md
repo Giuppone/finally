@@ -14,7 +14,7 @@ This is the capstone project for an agentic AI coding course. It is built entire
 
 The user runs a single Docker command (or a provided start script). A browser opens to `http://localhost:8000`. No login, no signup. They immediately see:
 
-- A watchlist of 10 default tickers with live-updating prices in a grid
+- A watchlist of tickers with live-updating prices in a grid
 - $10,000 in virtual cash
 - A dark, data-rich trading terminal aesthetic
 - An AI chat panel ready to assist
@@ -68,6 +68,7 @@ The user runs a single Docker command (or a provided start script). A browser op
 - **Real-time data**: Server-Sent Events (SSE) — simpler than WebSockets, one-way server→client push, works everywhere
 - **AI integration**: LiteLLM → OpenRouter (Cerebras for fast inference), with structured outputs for trade execution
 - **Market data**: Environment-variable driven — simulator by default, real data via Massive API if key provided
+- **Process model**: Exactly **one** `uvicorn` worker. The price cache and the background market-data task live in process memory, so a second worker would get its own independent cache plus a second writer racing on the same SQLite file. Scale by introducing a shared cache and database, never by raising the worker count.
 
 ### Why These Choices
 
@@ -88,7 +89,7 @@ The user runs a single Docker command (or a provided start script). A browser op
 finally/
 ├── frontend/                 # Next.js TypeScript project (static export)
 ├── backend/                  # FastAPI uv project (Python)
-│   └── db/                   # Schema definitions, seed data, migration logic
+│   └── app/schema/           # Schema definitions, seed data, init logic
 ├── planning/                 # Project-wide documentation for agents
 │   ├── PLAN.md               # This document
 │   └── ...                   # Additional agent reference docs
@@ -110,7 +111,7 @@ finally/
 
 - **`frontend/`** is a self-contained Next.js project. It knows nothing about Python. It talks to the backend via `/api/*` endpoints and `/api/stream/*` SSE endpoints. Internal structure is up to the Frontend Engineer agent.
 - **`backend/`** is a self-contained uv project with its own `pyproject.toml`. It owns all server logic including database initialization, schema, seed data, API routes, SSE streaming, market data, and LLM integration. Internal structure is up to the Backend/Market Data agents.
-- **`backend/db/`** contains schema SQL definitions and seed logic. The backend lazily initializes the database on first request — creating tables and seeding default data if the SQLite file doesn't exist or is empty.
+- **`backend/app/schema/`** contains schema SQL definitions and seed logic. The backend lazily initializes the database on first request — creating tables and seeding default data if the SQLite file doesn't exist or is empty. Note this path deliberately avoids `backend/db/`: the backend is copied to `/app` in the image, so a `backend/db/` would land on `/app/db` and be **shadowed at runtime by the data volume** mounted there, leaving lazy init with no schema to apply.
 - **`db/`** at the top level is the runtime volume mount point. The SQLite file (`db/finally.db`) is created here by the backend and persists across container restarts via Docker volume.
 - **`planning/`** contains project-wide documentation, including this plan. All agents reference files here as the shared contract.
 - **`test/`** contains Playwright E2E tests and supporting infrastructure (e.g., `docker-compose.test.yml`). Unit tests live within `frontend/` and `backend/` respectively, following each framework's conventions.
@@ -137,7 +138,13 @@ LLM_MOCK=false
 - If `MASSIVE_API_KEY` is set and non-empty → backend uses Massive REST API for market data
 - If `MASSIVE_API_KEY` is absent or empty → backend uses the built-in market simulator
 - If `LLM_MOCK=true` → backend returns deterministic mock LLM responses (for E2E tests)
-- The backend reads `.env` from the project root (mounted into the container or read via docker `--env-file`)
+- If `OPENROUTER_API_KEY` is absent **and** `LLM_MOCK` is not `true` → the backend **fails fast at startup** with an error naming the missing variable. Chat is a core feature; a silently half-working app is worse than a clear message.
+
+### How Variables Reach the Backend
+
+The backend reads configuration from `os.environ` only — it never parses a `.env` file itself. `.env` lives in the project root, is gitignored, and is passed to the container via `--env-file .env` (or the `env_file:` key in compose). This is a single mechanism with a single source of truth; do not also mount `.env` into the image.
+
+`.env.example` is committed with every key present and blank values, so contributors can copy it.
 
 ---
 
@@ -167,16 +174,31 @@ Both the simulator and the Massive client implement the same abstract interface.
 ### Shared Price Cache
 
 - A single background task (simulator or Massive poller) writes to an in-memory price cache
-- The cache holds the latest price, previous price, and timestamp for each ticker
 - SSE streams read from this cache and push updates to connected clients
 - This architecture supports future multi-user scenarios without changes to the data layer
+
+**Per-ticker cache entry:**
+
+| Field | Meaning |
+|---|---|
+| `price` | Latest price |
+| `prev_price` | Price at the previous tick (drives the green/red flash direction) |
+| `open_price` | Session anchor for daily change % — the seed price for the simulator, the daily open from the API for Massive. Set once when the ticker enters the cache and not overwritten by ticks. |
+| `ts` | ISO timestamp of the latest tick |
+| `history` | Bounded ring buffer of recent `(ts, price)` points — see below |
+
+Daily change % is `(price - open_price) / open_price`. Without `open_price` this is not computable: `prev_price` is the last *tick*, not the session open, so differencing against it yields a per-tick delta near zero rather than a daily move.
+
+**Price history ring buffer.** Each cache entry keeps the most recent ~1,000 `(ts, price)` points in memory (roughly 8 minutes at the 500ms cadence, longer under Massive polling). This backs `GET /api/prices/{ticker}/history` so the main chart renders immediately on page load instead of starting blank and filling in over minutes. It is deliberately in-memory and bounded — history does not survive a restart, and that is acceptable for a simulated workstation.
+
+**Tracked ticker set.** The cache tracks the **union of watchlist tickers and open-position tickers**, not the watchlist alone. A user can buy a ticker and then remove it from the watchlist; the position survives (there is no cascade delete), and if its price stopped updating the portfolio value, heatmap, and P&L chart would all silently go stale. The set is recomputed whenever the watchlist or positions change.
 
 ### SSE Streaming
 
 - Endpoint: `GET /api/stream/prices`
 - Long-lived SSE connection; client uses native `EventSource` API
-- Server pushes price updates for all tickers known to the system at a regular cadence (~500ms) — in the single-user model this is equivalent to the user's watchlist
-- Each SSE event contains ticker, price, previous price, timestamp, and change direction
+- Server pushes price updates for every ticker in the tracked set (watchlist ∪ open positions) at a regular cadence (~500ms)
+- Each SSE event contains ticker, price, previous price, open price, timestamp, and change direction
 - Client handles reconnection automatically (EventSource has built-in retry)
 
 ---
@@ -242,7 +264,9 @@ All tables include a `user_id` column defaulting to `"default"`. This is hardcod
 ### Default Seed Data
 
 - One user profile: `id="default"`, `cash_balance=10000.0`
-- Ten watchlist entries: AAPL, GOOGL, MSFT, AMZN, TSLA, NVDA, META, JPM, V, NFLX
+- Ten watchlist entries: ALAB, MRVL, MU, AMD, INTC, PLTR, ANET, LRCX, AMAT, SLV
+
+Seed entries are bare exchange symbols — no company names, no punctuation — because that is all the schema stores and all a market data provider will accept. Two earlier entries were corrected here: `INTEL` → **`INTC`** (Intel's actual symbol; `INTEL` 404s against any real provider) and `MU / Micron` → **`MU`**. This matters in practice because a non-empty `MASSIVE_API_KEY` routes seed tickers straight to the live API on first run.
 
 ---
 
@@ -252,6 +276,7 @@ All tables include a `user_id` column defaulting to `"default"`. This is hardcod
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/stream/prices` | SSE stream of live price updates |
+| GET | `/api/prices/{ticker}/history` | Recent `(ts, price)` points from the cache ring buffer, so charts render populated on first paint |
 
 ### Portfolio
 | Method | Path | Description |
@@ -271,6 +296,7 @@ All tables include a `user_id` column defaulting to `"default"`. This is hardcod
 | Method | Path | Description |
 |--------|------|-------------|
 | POST | `/api/chat` | Send a message, receive complete JSON response (message + executed actions) |
+| GET | `/api/chat/history` | Prior conversation, so a page reload restores the panel instead of showing an empty chat the LLM still remembers |
 
 ### System
 | Method | Path | Description |
@@ -290,7 +316,7 @@ There is an OPENROUTER_API_KEY in the .env file in the project root.
 When the user sends a chat message, the backend:
 
 1. Loads the user's current portfolio context (cash, positions with P&L, watchlist with live prices, total portfolio value)
-2. Loads recent conversation history from the `chat_messages` table
+2. Loads conversation history from the `chat_messages` table — messages from the **last 30 days, capped at the 50 most recent** (selected newest-first, then re-sorted ascending for the prompt). The cap rarely binds in normal use but keeps a heavy chat session from inflating prompt size and cost without bound.
 3. Constructs a prompt with a system message, portfolio context, conversation history, and the user's new message
 4. Calls the LLM via LiteLLM → OpenRouter, requesting structured output, using the cerebras-inference skill
 5. Parses the complete structured JSON response
@@ -327,6 +353,10 @@ Trades specified by the LLM execute automatically — no confirmation dialog. Th
 
 If a trade fails validation (e.g., insufficient cash), the error is included in the chat response so the LLM can inform the user.
 
+**Trades execute sequentially, never in parallel.** Each trade in the `trades` array is validated against the balance left by the trades before it, in array order. Validating them all against the pre-response snapshot would let two individually-affordable buys both pass and drive cash negative. A partial batch is a valid outcome: earlier trades stand, the first failure and every subsequent trade are reported back with their reason.
+
+**Tickers outside the watchlist are auto-added.** If the LLM trades a ticker the user isn't watching, the backend adds it to the watchlist first, which pulls it into the tracked ticker set (§6) and gives it a live price. Without this the trade would have no price to fill at. The watchlist addition is reported in the response's actions alongside the trade.
+
 ### System Prompt Guidance
 
 The LLM should be prompted as "FinAlly, an AI trading assistant" with instructions to:
@@ -352,8 +382,8 @@ When `LLM_MOCK=true`, the backend returns deterministic mock responses instead o
 
 The frontend is a single-page application with a dense, terminal-inspired layout. The specific component architecture and layout system is up to the Frontend Engineer, but the UI should include these elements:
 
-- **Watchlist panel** — grid/table of watched tickers with: ticker symbol, current price (flashing green/red on change), daily change %, and a sparkline mini-chart (accumulated from SSE since page load)
-- **Main chart area** — larger chart for the currently selected ticker, with at minimum price over time. Clicking a ticker in the watchlist selects it here.
+- **Watchlist panel** — grid/table of watched tickers with: ticker symbol, current price (flashing green/red on change), daily change % (computed from the `open_price` anchor on each SSE event, not from the previous tick), and a sparkline mini-chart
+- **Main chart area** — larger chart for the currently selected ticker, with at minimum price over time. Seeded from `GET /api/prices/{ticker}/history` on selection so it renders populated immediately, then extended live from the SSE stream. Clicking a ticker in the watchlist selects it here.
 - **Portfolio heatmap** — treemap visualization where each rectangle is a position, sized by portfolio weight, colored by P&L (green = profit, red = loss)
 - **P&L chart** — line chart showing total portfolio value over time, using data from `portfolio_snapshots`
 - **Positions table** — tabular view of all positions: ticker, quantity, avg cost, current price, unrealized P&L, % change
@@ -366,6 +396,8 @@ The frontend is a single-page application with a dense, terminal-inspired layout
 - Use `EventSource` for SSE connection to `/api/stream/prices`
 - Canvas-based charting library preferred (Lightweight Charts or Recharts) for performance
 - Price flash effect: on receiving a new price, briefly apply a CSS class with background color transition, then remove it
+- Seed charts and sparklines from `/api/prices/{ticker}/history`, then append SSE ticks — this avoids the blank-chart-on-load problem
+- Restore the chat panel from `/api/chat/history` on mount, so a refresh doesn't show an empty conversation the assistant still has context for
 - All API calls go to the same origin (`/api/*`) — no CORS configuration needed
 - Tailwind CSS for styling with a custom dark theme
 
@@ -386,10 +418,12 @@ Stage 2: Python 3.12 slim
   - uv sync (install Python dependencies from lockfile)
   - Copy frontend build output into a static/ directory
   - Expose port 8000
-  - CMD: uvicorn serving FastAPI app
+  - CMD: uvicorn serving FastAPI app (single worker — see below)
 ```
 
 FastAPI serves the static frontend files and all API routes on port 8000.
+
+**Run with exactly one worker.** Do not pass `--workers N` (N > 1) or use Gunicorn with multiple uvicorn workers. Per §3, the price cache and the market-data background task are in-process: extra workers would each spin up their own cache and their own simulator/poller, so clients would see different prices depending on which worker served their SSE connection, and multiple processes would contend for writes on one SQLite file.
 
 ### Docker Volume
 
@@ -454,3 +488,40 @@ The container is designed to deploy to AWS App Runner, Render, or any container 
 - Portfolio visualization: heatmap renders with correct colors, P&L chart has data points
 - AI chat (mocked): send a message, receive a response, trade execution appears inline
 - SSE resilience: disconnect and verify reconnection
+
+---
+
+## 13. Decision Record
+
+*Doc review 2026-08-08. Every item below is **resolved** and already folded into §1–§12 above — this section exists so the reasoning survives, not as a to-do list.*
+
+| # | Question | Decision | Landed in |
+|---|---|---|---|
+| 1 | Is the empty `backend/` intentional? | Yes — deleted deliberately to regenerate brand-new code. Prior design notes remain in `planning/archive/`. `CLAUDE.md` updated to drop the "completed" claim and the dead `MARKET_DATA_SUMMARY.md` pointer. | `CLAUDE.md` |
+| 2 | Where does the main chart get its history? | Add a bounded ring buffer (~1,000 points) per cache entry, exposed as `GET /api/prices/{ticker}/history`. Charts seed from it, then extend live from SSE. | §6, §8, §10 |
+| 3 | What anchors "daily change %"? | Add `open_price` to each cache entry — seed price for the simulator, daily open from the API for Massive. Change % is `(price - open_price) / open_price`. | §6, §10 |
+| 4 | Is chat history restored on reload? | Yes — `GET /api/chat/history`, called on mount. | §8, §10 |
+| 5 | How are multiple LLM trades validated? | Always sequentially, each against the balance left by its predecessors. Partial batches are valid; failures report the reason. | §9 |
+| 6 | Can the LLM trade an unwatched ticker? | Auto-add it to the watchlist first, which pulls it into the tracked set and gives it a live price. Reported in the response actions. | §6, §9 |
+| 7 | Missing `OPENROUTER_API_KEY` with `LLM_MOCK` unset? | Fail fast at startup with an error naming the variable. | §5 |
+| 8 | How much chat history enters the prompt? | Last 30 days, capped at the 50 most recent messages. | §9 |
+
+### Inconsistencies corrected
+
+1. **`backend/db/` shadowed by the data volume.** The backend is copied to `/app`, so `backend/db/` would land on `/app/db` — exactly where the SQLite volume mounts — hiding the schema files from lazy init at runtime. Schema code moved to **`backend/app/schema/`**; `/app/db` is now purely a data volume. (§4)
+
+2. **Two malformed seed tickers.** `INTEL` → **`INTC`** (Intel's real symbol; `INTEL` 404s against any provider) and `MU / Micron` → **`MU`**. Seed entries are bare exchange symbols only. (§7)
+
+3. **Live API is the local default, not the simulator.** The project-root `.env` carries a populated `MASSIVE_API_KEY`, so per §5 this machine hits the real Massive API on first run rather than the simulator §6 calls "recommended for most users." Fixing item 2 above is what makes that safe. To develop against the simulator instead, blank the key locally.
+
+4. **Stale prices on de-watchlisted positions.** The cache now tracks the **union of watchlist and open-position tickers**. Previously, buying a ticker and then removing it from the watchlist left the position with a frozen price, silently corrupting portfolio value, the heatmap, and the P&L chart. (§6)
+
+5. **`.gitignore` was Python-only.** Added `node_modules/`, `.next/`, `out/`, and the frontend build artifacts a Next.js `frontend/` will produce, plus `db/finally.db` — which §4 already claimed was ignored but wasn't. (`.gitignore`)
+
+6. **Single-worker constraint was implicit.** The in-process price cache and background task only behave correctly under one uvicorn worker; multiple workers would each hold a private cache and race on SQLite writes. Now stated explicitly. (§3, §11)
+
+7. **Two competing env-delivery mechanisms.** §5 said the backend reads `.env` from the project root while §11 passed `--env-file` — and inside the container no project-root `.env` exists. Settled on `--env-file` plus `os.environ`; the backend never parses `.env` itself. (§5)
+
+### Still open
+
+- **Charting library.** §10 still offers "Lightweight Charts or Recharts." The UI needs line charts, sparklines, *and* a treemap; Lightweight Charts has no treemap, so that branch quietly costs a second charting dependency. Left as the Frontend Engineer's call.
