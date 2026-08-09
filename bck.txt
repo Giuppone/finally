@@ -1,3 +1,7 @@
 ALAB, MRVL, MU / Micron, AMD, INTEL, PLTR, ANET, LRCX, AMAT, SLV
 
 AAPL, GOOGL, MSFT, AMZN, TSLA, NVDA, META, JPM, V, NFLX
+
+codex exec "Please review planning/PLAN.md and write your feedback to planning/Review.md"
+
+powershell -ExecutionPolicy ByPass -c "irm https://chatgpt.com/codex/install.ps1 | iex"                                                                                                                         
