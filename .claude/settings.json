@@ -3,5 +3,21 @@
     "frontend-design@claude-plugins-official": true,
     "context7@claude-plugins-official": true,
     "playwright@claude-plugins-official": true
+  },
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd \"${CLAUDE_PROJECT_DIR:-.}\" || exit 0; command -v codex >/dev/null 2>&1 || exit 0; [ -n \"$(git status --porcelain 2>/dev/null)\" ] || exit 0; codex exec -s danger-full-access \"Review all changes since the last commit (git diff HEAD, plus any untracked files) and write feedback to planning/Review-commit.md\" </dev/null >/dev/null 2>&1",
+            "shell": "bash",
+            "async": true,
+            "timeout": 600,
+            "statusMessage": "Codex reviewing changes..."
+          }
+        ]
+      }
+    ]
   }
 }
