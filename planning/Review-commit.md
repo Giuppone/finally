@@ -2,36 +2,36 @@
 
 ## Findings
 
-### P1 - Concurrent `sync_tracked()` calls can leave the service tracking neither caller's intended set
+### P1 — Reset is not serialized with trade execution, so an order can survive a successful reset
 
-[`MARKET_DATA_DESIGN.md`](MARKET_DATA_DESIGN.md#L1258) takes `self._lock` only while removing symbols, then releases it before calling `_track(added)`. `_track()` itself performs an awaited anchor lookup and mutates `_tracked` without the lock ([line 1271](MARKET_DATA_DESIGN.md#L1271)). Two concurrent reconciliations for `{A}` and `{B}` can therefore both compute their additions from the same old set and then each add its symbol; the final set becomes `{A, B}`, even though the later reconciliation intended `{B}`. An `add_ticker()` racing a reconciliation has the same duplicate-prime / stale-membership problem.
+[`execute_trade`](../backend/app/portfolio.py#L164) uses `trade_lock()` only around the
+database mutation and its tracked-set reconciliation. [`post_reset`](../backend/app/routes.py#L116)
+does neither: it calls `db.reset()` and later reconciles a tracked set that was read before
+or after an overlapping trade. A trade that has already resolved its quote can therefore
+commit immediately after reset, leaving a position/trade in what the reset response calls a
+fresh account. In the opposite ordering, reset can apply its stale, seed-only tracked set
+after the trade's reconciliation and evict the newly held ticker from market tracking.
 
-Make reconciliation atomic with respect to the complete desired set. For example, serialize the full diff-and-add operation under one service lock (with a separate in-flight task or a carefully designed two-phase commit if network waits must occur outside the lock), and have `_track()` require that lock.
+Use the same account-operation lock for the complete reset operation (database reset,
+tracked-ticker read, and `sync_tracked`), so it cannot interleave with a trade. Add a
+concurrent reset/buy test that asserts the final state is one coherent outcome and that any
+remaining position is tracked and priced.
 
-### P1 - Calendar-day session rollover reanchors and consumes Massive requests during weekends and holidays
+### P2 — Concurrent snapshot writers can create duplicate, unchanged history points
 
-[`current_session_date()`](MARKET_DATA_DESIGN.md#L1136) deliberately returns Saturday and Sunday labels, and `_maybe_roll_session()` refreshes anchors whenever that label changes ([line 1307](MARKET_DATA_DESIGN.md#L1307)). The service continues polling the simulator on those days, so an ANCHORED instance will reset its daily change and perform a grouped-daily walkback on Saturday and again on Sunday. On Monday before 09:30 ET it labels the session Sunday and repeats the work, despite the last completed market session still being Friday.
+[`_snapshot`](../backend/app/portfolio.py#L282) performs `last_snapshot()` and
+`record_snapshot()` as separate autocommitted operations, without a transaction or lock.
+The background `SnapshotTask` and the trade-triggered `snapshot_now()` can both observe the
+same previous row (or no row), both decide the value changed, and both insert an identical
+snapshot. This defeats the explicit de-duplication rule and creates extra P&L chart points
+under normal timing races.
 
-This produces fictitious weekend "sessions", breaks a continuous simulated path by rebasing it to Friday's close multiple times, and spends Basic-tier requests outside a trading session. Derive the session identifier from a trading calendar (or retain the prior trading session until the next valid market open) and only run `refresh()`/reanchor when a new trading session begins.
-
-### P1 - The proposed rate limiter does not enforce the documented 5-requests-per-minute limit
-
-[`RateLimiter`](MARKET_DATA_DESIGN.md#L786) starts with five tokens and refills continuously, so it permits five requests immediately and a sixth about 12 seconds later. That is six requests in a rolling minute. The documented startup path can also make one entitlement probe plus up to seven grouped-daily walkback requests ([line 982](MARKET_DATA_DESIGN.md#L982)), while the key is limited to five per minute.
-
-On a provider that enforces the advertised rolling window this can immediately produce 429s, undermining the design's startup and rollover guarantees. Use a sliding-window limiter (record the last five request times), or conservatively space calls at least 12 seconds apart; explicitly account for the probe and failed walkback attempts in the startup budget.
-
-### P2 - The factory's "never raises" contract is broken by an invalid `SIM_SEED`
-
-[`build_market_service()`](MARKET_DATA_DESIGN.md#L1460) calls `int(sim_seed)` without validation. A malformed deployment value such as `SIM_SEED=abc` raises `ValueError` before either simulated fallback can be built, despite the surrounding documentation promising market-data startup never fails.
-
-Validate the value and log a warning while treating an invalid seed as unset (or fail configuration explicitly and adjust the stated contract). Add a test for the malformed value.
-
-### P2 - The shown source-conformance test cannot run with its shown stub gateway
-
-The `MassiveLiveSource` branch in [`test_source_conformance`](MARKET_DATA_DESIGN.md#L1943) calls `MassiveLiveSource.poll()`, which invokes `gateway.call_list()` ([line 1007](MARKET_DATA_DESIGN.md#L1007)). The supplied `StubGateway` defines only `call()` ([line 1929](MARKET_DATA_DESIGN.md#L1929)). Consequently this test fails with `AttributeError` before it exercises conformance.
-
-Add a `call_list()` implementation to the stub (and return snapshot data through it), or give the live-source test a compatible dedicated fake.
+Make the read/compare/insert sequence one `BEGIN IMMEDIATE` transaction, or serialize all
+snapshot writes through a per-event-loop lock. Cover two concurrent `snapshot_now()` calls
+and assert a single row is written.
 
 ## Verification
 
-Reviewed `git diff HEAD` and untracked files. The sole implementation change is the new `planning/MARKET_DATA_DESIGN.md`; no executable code or test suite was added to run.
+Reviewed `git diff HEAD` and every untracked file. `git diff --check HEAD` reported no
+whitespace errors. The backend suite passes: `cd backend && uv run pytest -q` — **185
+passed**.
