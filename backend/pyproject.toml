@@ -1,0 +1,36 @@
+[project]
+name = "finally-backend"
+version = "0.1.0"
+description = "FinAlly — AI trading workstation backend (FastAPI)"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "massive>=2.8.0",
+    # ZoneInfo("America/New_York") has no system tz database on Windows dev
+    # machines or slim images — MARKET_DATA_DESIGN.md §15.
+    "tzdata>=2025.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "httpx>=0.28",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# Without this `uv sync` fails with "Unable to determine which files to ship
+# inside the wheel" — MARKET_DATA_DESIGN.md §15 / Review.md C4.
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "strict"
+asyncio_default_fixture_loop_scope = "function"
+filterwarnings = ["error::DeprecationWarning:app.*"]
