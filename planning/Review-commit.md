@@ -2,33 +2,21 @@
 
 ## Findings
 
-### P2 — Invalid `--duration` values can silently stop or run the demo forever
+No findings.
 
-[`parse_args`](../backend/market_data_demo.py#L324) accepts every float for
-`--duration`, while [`run`](../backend/market_data_demo.py#L281) treats every
-truthy value as a bounded duration. Therefore, `--duration -1` exits successfully
-immediately, while `--duration nan` and `--duration inf` never satisfy the exit
-condition and run until interrupted. This conflicts with the documented contract that
-only `0` runs indefinitely and makes simple CLI typos misleading.
-
-Use an argparse type that accepts only finite values greater than or equal to zero.
-
-### P2 — The dashboard's error collector cannot receive market-data errors
-
-[`run`](../backend/market_data_demo.py#L257) sets the root logger level to `CRITICAL`
-and then adds `ErrorCollector` to the `app` logger at
-[line 258](../backend/market_data_demo.py#L258). `app` has no explicit level, so its
-children—including `app.market.service`—inherit `CRITICAL`. Their warning/error records
-are rejected before handlers are invoked; the dashboard can consequently show
-`DEGRADED` without displaying the exception that caused it.
-
-Set `app` to `WARNING` (and disable propagation if output must remain quiet), or attach
-the collector to a logger whose effective level admits those records.
+Reviewed the tracked diff and all untracked source, frontend, packaging, scripts, and
+Playwright test files. The chat flow uses the existing portfolio trade path, persists a
+completed user/assistant turn atomically, bounds history supplied to the model, and returns
+the executed/rejected action records the frontend displays. The frontend is statically
+exported and mounted after the API routes, so the single-container deployment continues to
+serve both the API and UI on one origin.
 
 ## Verification
 
-Reviewed `git diff HEAD` and the untracked `backend/market_data_demo.py`.
-`git diff --check HEAD` reported no whitespace errors. The backend suite passes:
-`uv run --directory backend pytest -q` — **191 passed**. Manual CLI verification
-confirmed that `--duration -1` exits successfully at `0.0s`; `--interval 0` is
-correctly rejected.
+- `cd backend && uv run pytest -q` — 224 passed.
+- `docker build -t finally:review .` — succeeded, including the Next.js production build.
+- Started the built image with `LLM_MOCK=true`; `GET /api/health` returned `status: ok` and
+  `GET /` returned HTTP 200.
+
+The host has no local Node/npm installation, so the frontend check was performed through the
+Docker image build rather than a standalone host `npm run build`.

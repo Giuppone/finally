@@ -19,6 +19,7 @@ import sqlite3
 import uuid
 from collections.abc import Callable
 from contextlib import contextmanager
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -190,6 +191,53 @@ def snapshots(conn: sqlite3.Connection, since: str | None = None, limit: int = 5
         rows = conn.execute(
             "SELECT total_value, recorded_at FROM portfolio_snapshots WHERE user_id = ? "
             "ORDER BY recorded_at DESC, rowid DESC LIMIT ?",
+            (user_id, limit),
+        ).fetchall()
+    return list(reversed(rows))
+
+
+def add_chat_message(conn: sqlite3.Connection, role: str, content: str,
+                     actions: str | None = None,
+                     user_id: str = DEFAULT_USER) -> dict[str, Any]:
+    """Append one turn. `actions` is a JSON string for assistant rows, null for user rows."""
+    row = {
+        "id": str(uuid.uuid4()),
+        "role": role,
+        "content": content,
+        "actions": actions,
+        "created_at": clock.now_iso(),
+    }
+    conn.execute(
+        "INSERT INTO chat_messages (id, user_id, role, content, actions, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (row["id"], user_id, role, content, actions, row["created_at"]),
+    )
+    return row
+
+
+def chat_messages(conn: sqlite3.Connection, limit: int = 50, days: int | None = 30,
+                  user_id: str = DEFAULT_USER) -> list[sqlite3.Row]:
+    """The `limit` most recent messages within `days`, returned oldest-first.
+
+    Newest-first in SQL and reversed in Python, because "the 50 most recent" and "the first
+    50" are different sets and only the former is wanted (PLAN.md §9 step 2). The window
+    keeps a heavy chat session from inflating prompt size and cost without bound; it rarely
+    binds in normal use. `days=None` lifts the age filter for the UI's history restore.
+    """
+    since = (
+        clock.to_iso(clock.now() - timedelta(days=days)) if days is not None else None
+    )
+    if since:
+        rows = conn.execute(
+            "SELECT id, role, content, actions, created_at FROM chat_messages "
+            "WHERE user_id = ? AND created_at >= ? "
+            "ORDER BY created_at DESC, rowid DESC LIMIT ?",
+            (user_id, since, limit),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT id, role, content, actions, created_at FROM chat_messages "
+            "WHERE user_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?",
             (user_id, limit),
         ).fetchall()
     return list(reversed(rows))

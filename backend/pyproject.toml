@@ -11,6 +11,8 @@ dependencies = [
     # ZoneInfo("America/New_York") has no system tz database on Windows dev
     # machines or slim images — MARKET_DATA_DESIGN.md §15.
     "tzdata>=2025.1",
+    "litellm>=1.97.0",
+    "pydantic>=2.13.4",
 ]
 
 [dependency-groups]

@@ -1,0 +1,23 @@
+# Convenience wrapper around the same image the start scripts build (PLAN.md §11).
+# Production is a single container; this exists so `docker compose up` works for people who
+# prefer it.
+
+services:
+  finally:
+    build: .
+    image: finally:latest
+    container_name: finally
+    ports:
+      - "8000:8000"
+    # Secrets stay out of the image and out of this file. Copy .env.example to .env first.
+    env_file:
+      - .env
+    volumes:
+      # Named volume, so the SQLite database survives `down` and image rebuilds.
+      - finally-data:/app/db
+    restart: unless-stopped
+    # No `deploy.replicas` and no worker flags: the price cache and the market-data task are
+    # in-process, so exactly one container and one worker (PLAN.md §3).
+
+volumes:
+  finally-data:

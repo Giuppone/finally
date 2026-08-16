@@ -1,0 +1,51 @@
+# E2E stack: the real production image plus a Playwright container (PLAN.md §12).
+#
+# Browser dependencies stay OUT of the production image — that is the whole reason this is a
+# separate compose file rather than a stage in the Dockerfile.
+#
+#   docker compose -f test/docker-compose.test.yml up --build --exit-code-from playwright
+
+services:
+  app:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: finally:latest
+    environment:
+      # Deterministic, free and offline: no OpenRouter key needed and no model call made.
+      LLM_MOCK: "true"
+      # Empty on purpose — the E2E stack must not depend on a Massive key, so it runs in
+      # SIMULATED mode and the fresh-start spec can assert that badge.
+      MASSIVE_API_KEY: ""
+      SIM_SEED: "42"
+    # No volume: every run starts from an empty database, which is what makes the
+    # fresh-start scenario meaningful. `/api/portfolio/reset` covers reruns within a run.
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import json, urllib.request, sys
+          d = json.load(urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=4))
+          sys.exit(0 if d['status'] == 'ok' else 1)
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+  playwright:
+    image: mcr.microsoft.com/playwright:v1.62.1-noble
+    depends_on:
+      app:
+        # Gated on real readiness — schema applied AND market task ticking — so the first
+        # spec does not race the seed watchlist into existence.
+        condition: service_healthy
+    environment:
+      BASE_URL: http://app:8000
+      CI: "true"
+    volumes:
+      - .:/e2e
+    working_dir: /e2e
+    # `npm ci` needs the committed package-lock.json; the image already ships the browsers.
+    command: sh -c "npm ci --no-audit --no-fund && npx playwright test"

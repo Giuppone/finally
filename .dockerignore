@@ -1,0 +1,36 @@
+# Keep the build context small and the image free of host state.
+
+.git
+.github
+.claude
+.venv
+**/.venv
+**/__pycache__
+**/*.py[cod]
+**/.pytest_cache
+**/.ruff_cache
+**/.mypy_cache
+
+# Rebuilt inside the image — copying the host's version would risk shipping a stale export.
+frontend/node_modules
+frontend/.next
+frontend/out
+
+# The SQLite file belongs to the runtime volume, never to the image.
+db/*.db
+db/*.db-journal
+db/*.db-wal
+db/*.db-shm
+
+# Secrets reach the container via --env-file at run time (PLAN.md §5, §13 item 7).
+.env
+
+# Docs, tests and tooling the server does not need.
+planning
+test
+test-results
+playwright-report
+*.md
+!backend/README.md
+bck.txt
+LICENSE
