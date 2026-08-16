@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import random
 import time
+from collections.abc import Iterable
 
 from .models import Tick
 from .seeds import (
@@ -93,21 +94,42 @@ class GBMEngine:
         return self._price.get(ticker)
 
     # ---- the step ----------------------------------------------------
-    def step(self) -> dict[str, float]:
-        """Advance one tick. Returns {ticker: price} at full precision."""
-        n = len(self._tickers)
+    def step(self, tickers: Iterable[str] | None = None) -> dict[str, float]:
+        """Advance one tick. Returns {ticker: price} at full precision.
+
+        `None` advances every registered path — the steady-state loop, and the fast path
+        since the cached Cholesky factor applies as-is.
+
+        A strict subset advances ONLY those paths. This exists because `poll()` used to
+        step everything and merely *filter* the returned list, so `add_ticker()`'s
+        single-ticker poll silently moved every other tracked ticker one unscheduled step:
+        its new price was written to the engine but never emitted as a Tick, so the next
+        regular poll reported two compounded steps of variance as one. That broke the
+        SIM_SEED bit-reproducibility guarantee (D13) in exactly the flow E2E replays — the
+        LLM auto-adding a ticker mid-run (Market_data_review.md P2).
+        """
+        active = self._tickers
+        if tickers is not None:
+            wanted = set(tickers)
+            active = [t for t in self._tickers if t in wanted]
+
+        n = len(active)
         if n == 0:
             return {}
 
+        # Full set -> the cached factor. A subset needs its own, since the correlation
+        # structure of the whole basket does not apply to a slice of it.
+        chol = self._chol if n == len(self._tickers) else _factor(active)
+
         z_ind = [self._rng.gauss(0.0, 1.0) for _ in range(n)]
-        if self._chol is None:
+        if chol is None:
             z = z_ind
         else:
             # L is lower-triangular, so only k <= i contribute — half a dense multiply.
-            z = [sum(self._chol[i][k] * z_ind[k] for k in range(i + 1)) for i in range(n)]
+            z = [sum(chol[i][k] * z_ind[k] for k in range(i + 1)) for i in range(n)]
 
         out: dict[str, float] = {}
-        for i, ticker in enumerate(self._tickers):
+        for i, ticker in enumerate(active):
             price = self._price[ticker] * math.exp(self._drift[ticker] + self._vol[ticker] * z[i])
             if self._rng.random() < JUMP_PROB:
                 shock = self._rng.uniform(JUMP_MIN, JUMP_MAX)
@@ -118,12 +140,19 @@ class GBMEngine:
 
     # ---- correlation --------------------------------------------------
     def _rebuild_cholesky(self) -> None:
-        n = len(self._tickers)
-        if n <= 1:
-            self._chol = None
-            return
-        matrix = correlation_matrix(self._tickers)
-        self._chol = _cholesky(matrix) or _cholesky(_ridge(matrix, 0.05))
+        self._chol = _factor(self._tickers)
+
+
+def _factor(tickers: list[str]) -> list[list[float]] | None:
+    """Cholesky factor for this ticker set, or None when there is nothing to correlate.
+
+    Falls back to a ridge-shrunk matrix when the measured blocks are not positive-definite
+    — which a bad SECTOR_RHO edit can cause, and which would otherwise crash the loop.
+    """
+    if len(tickers) <= 1:
+        return None
+    matrix = correlation_matrix(tickers)
+    return _cholesky(matrix) or _cholesky(_ridge(matrix, 0.05))
 
 
 def correlation_matrix(tickers: list[str]) -> list[list[float]]:
@@ -185,9 +214,10 @@ class SimulatedSource(MarketDataSource):
             self._engine.add_ticker(ticker, start_price=anchors.get(ticker))
 
     async def poll(self, tickers: list[str]) -> list[Tick]:
+        # Step ONLY what was asked for. Stepping everything and filtering the result moved
+        # untracked-this-call paths without ever reporting them (Market_data_review.md P2).
         now = time.time()
-        wanted = set(tickers)
-        return [Tick(t, p, now) for t, p in self._engine.step().items() if t in wanted]
+        return [Tick(t, p, now) for t, p in self._engine.step(tickers).items()]
 
     async def release(self, ticker: str) -> None:
         self._engine.remove_ticker(ticker)

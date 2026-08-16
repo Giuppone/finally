@@ -305,12 +305,22 @@ def _snapshot(conn: sqlite3.Connection, service: MarketDataService, user_id: str
         # an avg_cost-valued row that would sit in the P&L chart forever (Review.md B16).
         return False
 
-    previous = db.last_snapshot(conn, user_id)
-    if previous is not None and abs(float(previous["total_value"]) - state["total_value"]) < 0.005:
-        # An idle container would otherwise accumulate 2,880 identical rows a day (C3).
-        return False
+    # read-compare-insert in ONE transaction. Two writers reach here concurrently — the
+    # 30s snapshot_loop and the post-trade call inside execute_trade, on separate
+    # asyncio.to_thread workers — and as three loose statements both read the same
+    # last_snapshot, both judged the value "changed" against that stale read, and both
+    # inserted: one duplicate point on the P&L chart. BEGIN IMMEDIATE makes the second
+    # writer block and re-read after the first commits, so the dedupe below actually sees
+    # the row the other thread just wrote (Back_end_review.md P2).
+    with db.transaction(conn):
+        previous = db.last_snapshot(conn, user_id)
+        if previous is not None and (
+            abs(float(previous["total_value"]) - state["total_value"]) < 0.005
+        ):
+            # An idle container would otherwise accumulate 2,880 identical rows a day (C3).
+            return False
 
-    db.record_snapshot(conn, state["total_value"], user_id)
+        db.record_snapshot(conn, state["total_value"], user_id)
     return True
 
 

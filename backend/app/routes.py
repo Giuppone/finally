@@ -132,8 +132,17 @@ async def post_reset(service: MarketDataService = Depends(get_service)) -> dict:
     E2E needs it — the fresh-start scenario fails on the second run against a persisted
     volume otherwise — and it is the escape hatch when a demo's LLM drains the account
     (Review.md B9).
+
+    The whole operation runs under `trade_lock()` because `execute_trade` takes that same
+    lock, and a lock only one side takes serialises nothing (Back_end_review.md P1).
+    Unlocked, a trade already past its price read could commit ON TOP of the just-cleared
+    tables — leaving a position and a cash balance ≠ $10,000 inside what this response
+    reports as a fresh account. The tracked-set read and `sync_tracked` are inside too:
+    reading between another trade's commit and its own `sync_tracked` yields a set that
+    evicts a ticker whose position still exists, silently freezing its price.
     """
-    await db.run(db.reset)
-    tracked = await db.run(db.tracked_tickers)
-    await service.sync_tracked(tracked)
-    return await db.run(lambda conn: portfolio.value_portfolio(conn, service))
+    async with portfolio.trade_lock():
+        await db.run(db.reset)
+        tracked = await db.run(db.tracked_tickers)
+        await service.sync_tracked(tracked)
+        return await db.run(lambda conn: portfolio.value_portfolio(conn, service))

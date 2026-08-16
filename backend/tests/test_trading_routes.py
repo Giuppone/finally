@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 
-from app import db, routes
+from app import db, portfolio, routes
 from app.market import SEED_WATCHLIST, Tick
 from app.market import router as market_router
+from app.schema import STARTING_CASH
 
 
 @pytest_asyncio.fixture
@@ -196,3 +199,24 @@ async def test_reset_resyncs_the_tracked_set(
     tracked = await db.run(db.tracked_tickers)
     assert tracked == set(SEED_WATCHLIST)
     assert priced_service.tracked == tracked
+
+
+# ---- reset serialisation (Back_end_review.md P1) ----------------------------
+
+@pytest.mark.asyncio
+async def test_reset_waits_for_an_in_flight_trade(client: httpx.AsyncClient) -> None:
+    """`execute_trade` takes trade_lock(); a lock only one side takes serialises nothing.
+
+    Before the fix, reset ran straight through while a trade sat inside the lock holding a
+    price it was about to commit — so the trade's write could land on top of the cleared
+    tables, leaving a position and a cash balance != $10,000 in what reset just reported
+    as a fresh account. Holding the lock here stands in for that in-flight trade.
+    """
+    async with portfolio.trade_lock():
+        pending = asyncio.create_task(client.post("/api/portfolio/reset"))
+        await asyncio.sleep(0.05)
+        assert not pending.done(), "reset ran while a trade held the lock"
+
+    response = await pending
+    assert response.status_code == 200
+    assert response.json()["cash_balance"] == STARTING_CASH

@@ -275,3 +275,24 @@ async def test_snapshot_task_starts_and_stops(temp_db, priced_service) -> None:
     await asyncio.sleep(0.05)
     await task.stop()
     await task.stop()                                        # idempotent
+
+
+# ---- concurrent snapshot writers (Back_end_review.md P2) --------------------
+
+@pytest.mark.asyncio
+async def test_concurrent_snapshots_write_exactly_one_row(temp_db, priced_service) -> None:
+    """The 30s loop and a trade's post-commit snapshot can land in the same window.
+
+    Each db.run lands on its own asyncio.to_thread worker with its own connection, so as
+    three loose statements every writer read the same last_snapshot, judged the value
+    changed against that stale read, and inserted — duplicate points on the P&L chart.
+    """
+    await execute_trade("MU", "buy", 10, priced_service)
+    baseline = len(await db.run(lambda conn: db.snapshots(conn)))
+
+    priced_service.cache.apply(Tick("MU", 137.0, ts=2.0))
+    results = await asyncio.gather(*(portfolio.snapshot_now(priced_service) for _ in range(8)))
+
+    rows = await db.run(lambda conn: db.snapshots(conn))
+    assert len(rows) == baseline + 1
+    assert sum(results) == 1              # exactly one caller reports having written

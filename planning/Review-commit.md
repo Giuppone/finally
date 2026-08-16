@@ -1,37 +1,34 @@
-# Working-tree review (`HEAD` plus untracked files)
+# Review: working-tree changes since `HEAD`
 
 ## Findings
 
-### P1 — Reset is not serialized with trade execution, so an order can survive a successful reset
+### P2 — Invalid `--duration` values can silently stop or run the demo forever
 
-[`execute_trade`](../backend/app/portfolio.py#L164) uses `trade_lock()` only around the
-database mutation and its tracked-set reconciliation. [`post_reset`](../backend/app/routes.py#L116)
-does neither: it calls `db.reset()` and later reconciles a tracked set that was read before
-or after an overlapping trade. A trade that has already resolved its quote can therefore
-commit immediately after reset, leaving a position/trade in what the reset response calls a
-fresh account. In the opposite ordering, reset can apply its stale, seed-only tracked set
-after the trade's reconciliation and evict the newly held ticker from market tracking.
+[`parse_args`](../backend/market_data_demo.py#L324) accepts every float for
+`--duration`, while [`run`](../backend/market_data_demo.py#L281) treats every
+truthy value as a bounded duration. Therefore, `--duration -1` exits successfully
+immediately, while `--duration nan` and `--duration inf` never satisfy the exit
+condition and run until interrupted. This conflicts with the documented contract that
+only `0` runs indefinitely and makes simple CLI typos misleading.
 
-Use the same account-operation lock for the complete reset operation (database reset,
-tracked-ticker read, and `sync_tracked`), so it cannot interleave with a trade. Add a
-concurrent reset/buy test that asserts the final state is one coherent outcome and that any
-remaining position is tracked and priced.
+Use an argparse type that accepts only finite values greater than or equal to zero.
 
-### P2 — Concurrent snapshot writers can create duplicate, unchanged history points
+### P2 — The dashboard's error collector cannot receive market-data errors
 
-[`_snapshot`](../backend/app/portfolio.py#L282) performs `last_snapshot()` and
-`record_snapshot()` as separate autocommitted operations, without a transaction or lock.
-The background `SnapshotTask` and the trade-triggered `snapshot_now()` can both observe the
-same previous row (or no row), both decide the value changed, and both insert an identical
-snapshot. This defeats the explicit de-duplication rule and creates extra P&L chart points
-under normal timing races.
+[`run`](../backend/market_data_demo.py#L257) sets the root logger level to `CRITICAL`
+and then adds `ErrorCollector` to the `app` logger at
+[line 258](../backend/market_data_demo.py#L258). `app` has no explicit level, so its
+children—including `app.market.service`—inherit `CRITICAL`. Their warning/error records
+are rejected before handlers are invoked; the dashboard can consequently show
+`DEGRADED` without displaying the exception that caused it.
 
-Make the read/compare/insert sequence one `BEGIN IMMEDIATE` transaction, or serialize all
-snapshot writes through a per-event-loop lock. Cover two concurrent `snapshot_now()` calls
-and assert a single row is written.
+Set `app` to `WARNING` (and disable propagation if output must remain quiet), or attach
+the collector to a logger whose effective level admits those records.
 
 ## Verification
 
-Reviewed `git diff HEAD` and every untracked file. `git diff --check HEAD` reported no
-whitespace errors. The backend suite passes: `cd backend && uv run pytest -q` — **185
-passed**.
+Reviewed `git diff HEAD` and the untracked `backend/market_data_demo.py`.
+`git diff --check HEAD` reported no whitespace errors. The backend suite passes:
+`uv run --directory backend pytest -q` — **191 passed**. Manual CLI verification
+confirmed that `--duration -1` exits successfully at `0.0s`; `--interval 0` is
+correctly rejected.

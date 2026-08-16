@@ -135,8 +135,9 @@ LLM_MOCK=false
 
 ### Behavior
 
-- If `MASSIVE_API_KEY` is set and non-empty → backend uses Massive REST API for market data
-- If `MASSIVE_API_KEY` is absent or empty → backend uses the built-in market simulator
+- If `MASSIVE_API_KEY` is set and non-empty → the backend **probes what the key is entitled to** and resolves to `LIVE` or `ANCHORED` accordingly, degrading to `SIMULATED` if the key turns out to be unusable. It is not a binary switch — see §6 and §13 item 9
+- If `MASSIVE_API_KEY` is absent or empty → backend uses the built-in market simulator (`SIMULATED`)
+- There is deliberately **no env var to force a mode.** Hand-setting one would let a user select `LIVE` on a key that cannot serve it — the exact failure the probe exists to catch
 - If `LLM_MOCK=true` → backend returns deterministic mock LLM responses (for E2E tests)
 - If `OPENROUTER_API_KEY` is absent **and** `LLM_MOCK` is not `true` → the backend **fails fast at startup** with an error naming the missing variable. Chat is a core feature; a silently half-working app is worse than a clear message.
 
@@ -150,9 +151,19 @@ The backend reads configuration from `os.environ` only — it never parses a `.e
 
 ## 6. Market Data
 
-### Two Implementations, One Interface
+### Two Implementations, Three Modes, One Interface
 
-Both the simulator and the Massive client implement the same abstract interface. The backend selects which to use based on the environment variable. All downstream code (SSE streaming, price cache, frontend) is agnostic to the source.
+Both the simulator and the Massive client implement the same abstract interface. All downstream code (SSE streaming, price cache, frontend) is agnostic to the source.
+
+The backend does **not** pick between them on the mere presence of `MASSIVE_API_KEY`. It probes the key's entitlement at startup and resolves to one of three modes. Full derivation in `MARKET_DATA_DESIGN.md` §1–§2; decision recorded at §13 item 9.
+
+| Mode | When | Anchor (`open_price`) | Intraday motion |
+|---|---|---|---|
+| `LIVE` | Key entitled to snapshots (Starter+) | Real daily open from the API | Real, polled every ~15s |
+| `ANCHORED` | Key is aggregates-only (Basic) | **Real previous close** from the API | Simulated (GBM) |
+| `SIMULATED` | No key, unusable key, or SDK missing | Seed price from the table | Simulated (GBM) |
+
+`ANCHORED` exists because a Basic key 403s on both snapshot endpoints. Treating that as "no real data" would throw away a key that can still supply genuine closing prices — so the mode keeps the real anchor and simulates only the motion on top of it. **This is the mode a Basic key lands in, and it is what `/api/health` reports as `mode`.** The frontend should surface the mode rather than claiming "live" unconditionally.
 
 ### Simulator (Default)
 
@@ -167,9 +178,10 @@ Both the simulator and the Massive client implement the same abstract interface.
 
 - REST API polling (not WebSocket) — simpler, works on all tiers
 - Polls for the union of all watched tickers on a configurable interval
-- Free tier (5 calls/min): poll every 15 seconds
+- Basic tier (5 calls/min): rate-limited by a **sliding window**, not a token bucket — a bucket that starts full lets a sixth request through ~12s into the window, which is six inside a rolling minute against a limit of five
 - Paid tiers: poll every 2-15 seconds depending on tier
 - Parses REST response into the same format as the simulator
+- Only a Starter+ key reaches `LIVE`. A Basic key supplies anchors only, which is what `ANCHORED` is for
 
 ### Shared Price Cache
 
@@ -183,7 +195,7 @@ Both the simulator and the Massive client implement the same abstract interface.
 |---|---|
 | `price` | Latest price |
 | `prev_price` | Price at the previous tick (drives the green/red flash direction) |
-| `open_price` | Session anchor for daily change % — the seed price for the simulator, the daily open from the API for Massive. Set once when the ticker enters the cache and not overwritten by ticks. |
+| `open_price` | Session anchor for daily change %. Which price this is depends on the mode: seed price under `SIMULATED`, **real previous close** under `ANCHORED`, real daily open under `LIVE` (see the mode table above). Set once when the ticker enters the cache and not overwritten by ticks; it rolls only at the 09:30 ET session boundary. |
 | `ts` | ISO timestamp of the latest tick |
 | `history` | Bounded ring buffer of recent `(ts, price)` points — see below |
 
@@ -277,6 +289,7 @@ Seed entries are bare exchange symbols — no company names, no punctuation — 
 |--------|------|-------------|
 | GET | `/api/stream/prices` | SSE stream of live price updates |
 | GET | `/api/prices/{ticker}/history` | Recent `(ts, price)` points from the cache ring buffer, so charts render populated on first paint |
+| GET | `/api/prices/history?tickers=A,B,C` | Bulk form of the above. Seeds every watchlist sparkline in one round trip instead of N — the main chart uses the per-ticker route, the watchlist uses this one |
 
 ### Portfolio
 | Method | Path | Description |
@@ -284,6 +297,7 @@ Seed entries are bare exchange symbols — no company names, no punctuation — 
 | GET | `/api/portfolio` | Current positions, cash balance, total value, unrealized P&L |
 | POST | `/api/portfolio/trade` | Execute a trade: `{ticker, quantity, side}` |
 | GET | `/api/portfolio/history` | Portfolio value snapshots over time (for P&L chart) |
+| POST | `/api/portfolio/reset` | Back to $10,000, the seed watchlist, and no history. E2E needs it — the fresh-start scenario fails on a second run against a persisted volume otherwise — and it is the escape hatch when a demo's LLM drains the account. Runs under the same trade lock as `/api/portfolio/trade`, so it can never interleave with an in-flight trade |
 
 ### Watchlist
 | Method | Path | Description |
@@ -499,12 +513,13 @@ The container is designed to deploy to AWS App Runner, Render, or any container 
 |---|---|---|---|
 | 1 | Is the empty `backend/` intentional? | Yes — deleted deliberately to regenerate brand-new code. Prior design notes remain in `planning/archive/`. `CLAUDE.md` updated to drop the "completed" claim and the dead `MARKET_DATA_SUMMARY.md` pointer. | `CLAUDE.md` |
 | 2 | Where does the main chart get its history? | Add a bounded ring buffer (~1,000 points) per cache entry, exposed as `GET /api/prices/{ticker}/history`. Charts seed from it, then extend live from SSE. | §6, §8, §10 |
-| 3 | What anchors "daily change %"? | Add `open_price` to each cache entry — seed price for the simulator, daily open from the API for Massive. Change % is `(price - open_price) / open_price`. | §6, §10 |
+| 3 | What anchors "daily change %"? | Add `open_price` to each cache entry. Change % is `(price - open_price) / open_price`. *Which* price the anchor is turned out to depend on the mode — see item 9, which supersedes this row's "daily open from the API for Massive". | §6, §10 |
 | 4 | Is chat history restored on reload? | Yes — `GET /api/chat/history`, called on mount. | §8, §10 |
 | 5 | How are multiple LLM trades validated? | Always sequentially, each against the balance left by its predecessors. Partial batches are valid; failures report the reason. | §9 |
 | 6 | Can the LLM trade an unwatched ticker? | Auto-add it to the watchlist first, which pulls it into the tracked set and gives it a live price. Reported in the response actions. | §6, §9 |
 | 7 | Missing `OPENROUTER_API_KEY` with `LLM_MOCK` unset? | Fail fast at startup with an error naming the variable. | §5 |
 | 8 | How much chat history enters the prompt? | Last 30 days, capped at the 50 most recent messages. | §9 |
+| 9 | Does a populated `MASSIVE_API_KEY` really mean "real data"? | **No — the market data source resolves to one of three modes, not two.** Live probing showed §5's binary is unachievable: this project's Basic-tier key 403s on both snapshot endpoints, so "key set → real prices" would have failed closed to the simulator and silently thrown the key away. The backend now probes the key's entitlement at startup and picks: **`LIVE`** (Starter+, real snapshots polled every 15s), **`ANCHORED`** (Basic — real previous closes as the session anchor, simulated intraday motion on top), or **`SIMULATED`** (no key, unusable key, or SDK missing). The probe never raises; every failure degrades one step down. Mode is **deliberately not an env var** — a hand-set mode would let a user select LIVE on a key that cannot serve it, which is the exact failure the probe exists to prevent. Full derivation in `MARKET_DATA_DESIGN.md` §1–§2. | §5, §6 |
 
 ### Inconsistencies corrected
 
@@ -512,7 +527,7 @@ The container is designed to deploy to AWS App Runner, Render, or any container 
 
 2. **Two malformed seed tickers.** `INTEL` → **`INTC`** (Intel's real symbol; `INTEL` 404s against any provider) and `MU / Micron` → **`MU`**. Seed entries are bare exchange symbols only. (§7)
 
-3. **Live API is the local default, not the simulator.** The project-root `.env` carries a populated `MASSIVE_API_KEY`, so per §5 this machine hits the real Massive API on first run rather than the simulator §6 calls "recommended for most users." Fixing item 2 above is what makes that safe. To develop against the simulator instead, blank the key locally.
+3. **The real API is the local default, not the simulator.** The project-root `.env` carries a populated `MASSIVE_API_KEY`, so this machine hits Massive on first run rather than the simulator §6 calls "recommended for most users." Fixing item 2 above is what makes that safe. Verified 2026-08-15: that key is Basic-tier, so it resolves to **`ANCHORED`** — real previous closes, simulated intraday motion — not `LIVE`. To develop fully offline, blank the key locally.
 
 4. **Stale prices on de-watchlisted positions.** The cache now tracks the **union of watchlist and open-position tickers**. Previously, buying a ticker and then removing it from the watchlist left the position with a frozen price, silently corrupting portfolio value, the heatmap, and the P&L chart. (§6)
 

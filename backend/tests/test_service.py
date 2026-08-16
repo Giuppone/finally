@@ -334,3 +334,34 @@ async def test_a_holiday_roll_does_not_fake_an_overnight_gap() -> None:
     quote = cache.get("MU")
     assert quote.open_price == 877.57
     assert quote.price == 900.0                     # path untouched, no fake gap
+
+
+# ---- add_ticker isolation (Market_data_review.md P2) -------------------------
+
+@pytest.mark.asyncio
+async def test_add_ticker_does_not_move_the_other_tracked_paths() -> None:
+    """The review's own reproduction, as a regression test.
+
+    add_ticker() does one immediate poll so the new ticker comes back priced. Before the
+    fix that poll stepped EVERY registered path, so MU moved here without ever reporting
+    a tick — its next regular poll then showed two compounded steps as one, and SIM_SEED
+    reproducibility broke for any run that adds a ticker mid-flight.
+    """
+    engine = GBMEngine(seed=42)
+    service = MarketDataService(
+        source=SimulatedSource(engine, poll_interval=1000),   # loop never fires
+        anchors=StaticAnchorProvider(),
+        cache=PriceCache(),
+        mode=Mode.SIMULATED,
+    )
+    await service.start({"MU"})
+    try:
+        before = engine.price("MU")
+        cached_before = service.quote("MU").price
+
+        assert await service.add_ticker("AMD") is not None
+
+        assert engine.price("MU") == before
+        assert service.quote("MU").price == cached_before
+    finally:
+        await service.stop()

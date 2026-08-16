@@ -196,3 +196,56 @@ def test_jumps_stay_within_their_magnitude_bound() -> None:
         price = engine.step()["MU"]
         assert abs(math.log(price / previous)) < JUMP_MAX * 3
         previous = price
+
+
+# ---- subset stepping (Market_data_review.md P2) ------------------------------
+
+def test_stepping_a_subset_leaves_the_other_paths_untouched() -> None:
+    """add_ticker()'s single-ticker poll must not move every other tracked path.
+
+    Against the pre-fix engine (step() advanced everything and poll() merely filtered the
+    result) AMD drifts here even though only MU was asked for.
+    """
+    engine = GBMEngine(seed=42)
+    for ticker in ("MU", "AMD", "SLV"):
+        engine.add_ticker(ticker)
+
+    untouched = {t: engine.price(t) for t in ("AMD", "SLV")}
+    moved = engine.price("MU")
+
+    out = engine.step(["MU"])
+
+    assert set(out) == {"MU"}
+    assert engine.price("MU") != moved
+    for ticker, price in untouched.items():
+        assert engine.price(ticker) == price
+
+
+def test_stepping_an_empty_subset_is_a_no_op() -> None:
+    engine = GBMEngine(seed=42)
+    engine.add_ticker("MU")
+    before = engine.price("MU")
+    assert engine.step([]) == {}
+    assert engine.price("MU") == before
+
+
+def test_a_subset_step_still_correlates_within_the_subset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A subset gets its own Cholesky factor, so the 0.90 LRCX/AMAT semicap block must
+    survive being stepped without the rest of the basket. Jumps off for the same reason
+    `_measure_rho` turns them off — they are drawn per ticker and dilute the measurement.
+    """
+    monkeypatch.setattr(simulator, "JUMP_PROB", 0.0)
+    engine = GBMEngine(seed=7)
+    for ticker in ("LRCX", "AMAT", "PLTR", "SLV"):
+        engine.add_ticker(ticker)
+
+    paths: dict[str, list[float]] = {"LRCX": [], "AMAT": []}
+    for _ in range(20_000):
+        prices = engine.step(["LRCX", "AMAT"])
+        for ticker, series in paths.items():
+            series.append(prices[ticker])
+
+    measured = statistics.correlation(_log_returns(paths["LRCX"]), _log_returns(paths["AMAT"]))
+    assert measured == pytest.approx(0.90, abs=0.05)
