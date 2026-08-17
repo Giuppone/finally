@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { AnalyticsPanel, type AnalyticsTab } from "@/components/AnalyticsPanel";
 import { ChatPanel } from "@/components/ChatPanel";
 import { Header } from "@/components/Header";
 import { Heatmap } from "@/components/Heatmap";
@@ -38,6 +39,9 @@ export default function Terminal() {
   const [sending, setSending] = useState(false);
   const [chatError, setChatError] = useState<string | null>(null);
   const [mock, setMock] = useState(false);
+
+  const [analyticsOpen, setAnalyticsOpen] = useState(false);
+  const [analyticsTab, setAnalyticsTab] = useState<AnalyticsTab>("risk");
 
   const [tradeTicker, setTradeTicker] = useState("");
   const [tradeQuantity, setTradeQuantity] = useState("");
@@ -242,6 +246,10 @@ export default function Terminal() {
             positions={live?.positions ?? []}
             selected={selected}
             onSelect={selectTicker}
+            onAnalyze={(tab) => {
+              setAnalyticsTab(tab);
+              setAnalyticsOpen(true);
+            }}
           />
         </div>
 
@@ -254,6 +262,19 @@ export default function Terminal() {
           onSend={(text) => void handleSend(text)}
         />
       </div>
+
+      <AnalyticsPanel
+        open={analyticsOpen}
+        tab={analyticsTab}
+        positions={live?.positions ?? []}
+        watchlist={entries.map((entry) => entry.ticker)}
+        onTab={setAnalyticsTab}
+        onClose={() => setAnalyticsOpen(false)}
+        onApplied={() => {
+          void refreshPortfolio().catch(() => {});
+          void refreshSnapshots().catch(() => {});
+        }}
+      />
 
       <TradeBar
         ticker={tradeTicker}

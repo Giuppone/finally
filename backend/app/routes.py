@@ -12,7 +12,7 @@ import logging
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from . import db, portfolio
+from . import clock, db, portfolio
 from .market import InvalidTicker, MarketDataService, get_service, normalize_ticker
 
 log = logging.getLogger(__name__)
@@ -20,6 +20,10 @@ log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api", tags=["trading"])
 
 MAX_HISTORY_POINTS = 2_000
+
+# Bumped only when a saved document stops being readable as-is. `POST /api/session`
+# rejects anything else rather than guessing at a shape it does not know.
+SESSION_VERSION = 1
 
 
 class WatchlistAdd(BaseModel):
@@ -30,6 +34,42 @@ class TradeRequest(BaseModel):
     ticker: str = Field(..., min_length=1, max_length=12)
     quantity: float
     side: str = Field(..., pattern="^(buy|sell)$")
+
+
+class RebalanceLeg(BaseModel):
+    ticker: str = Field(..., min_length=1, max_length=12)
+    quantity: float
+    side: str = Field(..., pattern="^(buy|sell)$")
+
+
+class RebalanceExecution(BaseModel):
+    """Exactly the `trades` array `POST /api/analytics/rebalance` returns, so the frontend
+    can hand the suggestion straight back without reshaping it."""
+
+    trades: list[RebalanceLeg] = Field(default_factory=list)
+
+
+class SessionPosition(BaseModel):
+    ticker: str = Field(..., min_length=1, max_length=12)
+    # gt=0: a zero-quantity row is the phantom position `_apply` deletes on a full sell
+    # (Review.md B11), and restoring one would put it straight back.
+    quantity: float = Field(..., gt=0)
+    avg_cost: float = Field(..., ge=0)
+
+
+class SessionDocument(BaseModel):
+    """What `GET /api/session` emits and `POST /api/session` accepts.
+
+    `meta` is accepted and ignored — it is there so a saved file is readable by a human,
+    not so the import can trust it.
+    """
+
+    version: int = SESSION_VERSION
+    cash_balance: float = Field(..., ge=0)
+    positions: list[SessionPosition] = Field(default_factory=list)
+    watchlist: list[str] = Field(default_factory=list)
+    saved_at: str | None = None
+    meta: dict | None = None
 
 
 def _normalize(raw: str) -> str:
@@ -146,3 +186,127 @@ async def post_reset(service: MarketDataService = Depends(get_service)) -> dict:
         tracked = await db.run(db.tracked_tickers)
         await service.sync_tracked(tracked)
         return await db.run(lambda conn: portfolio.value_portfolio(conn, service))
+
+
+@router.post("/portfolio/rebalance")
+async def post_rebalance(
+    body: RebalanceExecution,
+    service: MarketDataService = Depends(get_service),
+) -> dict:
+    """Execute a trade list from `POST /api/analytics/rebalance`.
+
+    Separate from the suggestion endpoint on purpose: a button labelled "suggest" must not
+    trade. The whole batch runs under one hold of `trade_lock()` so nothing interleaves
+    between the sells and the buys - see `portfolio.execute_batch`.
+    """
+    if not body.trades:
+        raise HTTPException(400, "no trades to execute")
+
+    legs = [(leg.ticker, leg.side, leg.quantity) for leg in body.trades]
+    results = await portfolio.execute_batch(legs, service)
+    state = await db.run(lambda conn: portfolio.value_portfolio(conn, service))
+    return {
+        "trades": [result.to_wire() for result in results],
+        "filled": sum(1 for result in results if result.filled),
+        "rejected": sum(1 for result in results if not result.filled),
+        "portfolio": state,
+    }
+
+
+# ---- portfolio sessions ------------------------------------------------------
+
+@router.get("/session")
+async def get_session(service: MarketDataService = Depends(get_service)) -> dict:
+    """Export the portfolio as a document that `POST /api/session` restores exactly.
+
+    Cash, quantities and average costs are emitted **unrounded**. A save file exists to
+    round-trip a state, and rounding cash to the cent turns "restore" into "restore, minus
+    a few cents that then compound through every later trade".
+
+    `meta` is informational only and is ignored on import: prices move, so a document
+    loaded tomorrow will not reproduce today's `total_value` and should not pretend to.
+    """
+
+    def read(conn) -> dict:
+        state = portfolio.value_portfolio(conn, service)
+        return {
+            "version": SESSION_VERSION,
+            "saved_at": clock.now_iso(),
+            "cash_balance": db.cash_balance(conn),
+            "positions": [
+                {
+                    "ticker": row["ticker"],
+                    "quantity": float(row["quantity"]),
+                    "avg_cost": float(row["avg_cost"]),
+                }
+                for row in db.positions(conn)
+            ],
+            "watchlist": [row["ticker"] for row in db.watchlist(conn)],
+            "meta": {
+                "mode": str(service.mode),
+                "total_value": state["total_value"],
+                "starting_cash": state["starting_cash"],
+                "all_priced": state["all_priced"],
+            },
+        }
+
+    return await db.run(read)
+
+
+@router.post("/session")
+async def post_session(
+    document: SessionDocument,
+    service: MarketDataService = Depends(get_service),
+) -> dict:
+    """Restore a saved portfolio: cash, positions and watchlist, replacing what is there.
+
+    Same locking as `/portfolio/reset`, for the same reason — an in-flight trade past its
+    price read would otherwise commit on top of the restored tables, and the tracked-set
+    read has to be inside too or it can evict a ticker whose position still exists.
+
+    Positions are restored with their saved `avg_cost`, which is why this exists as an
+    endpoint at all: replaying a session as market buys would fill at today's price and
+    silently rewrite every cost basis and the cash balance with it.
+    """
+    if document.version != SESSION_VERSION:
+        raise HTTPException(
+            400,
+            f"unsupported session version {document.version}; this build reads "
+            f"version {SESSION_VERSION}",
+        )
+
+    holdings: list[tuple[str, float, float]] = []
+    seen: set[str] = set()
+    for entry in document.positions:
+        symbol = _normalize(entry.ticker)
+        if symbol in seen:
+            # Two rows for one ticker has no single correct reading — merging them would
+            # invent an average cost the user never held.
+            raise HTTPException(400, f"duplicate position for {symbol}")
+        seen.add(symbol)
+        holdings.append((symbol, entry.quantity, entry.avg_cost))
+
+    tickers = sorted({_normalize(raw) for raw in document.watchlist})
+
+    async with portfolio.trade_lock():
+        await db.run(
+            lambda conn: db.import_session(
+                conn, cash=document.cash_balance, holdings=holdings, tickers=tickers
+            )
+        )
+        tracked = await db.run(db.tracked_tickers)
+        await service.sync_tracked(tracked)
+        state = await db.run(lambda conn: portfolio.value_portfolio(conn, service))
+        # The restored account is a new starting point for the P&L chart, which the import
+        # just emptied. Without this the chart stays blank until the 30s task next fires.
+        await portfolio.snapshot_now(service)
+
+    log.info(
+        "session loaded: %d positions, %d watched, cash %.2f",
+        len(holdings), len(tickers), document.cash_balance,
+    )
+    return {
+        "loaded": {"positions": len(holdings), "watchlist": len(tickers)},
+        "unpriced": [h["ticker"] for h in state["positions"] if not h["priced"]],
+        "portfolio": state,
+    }

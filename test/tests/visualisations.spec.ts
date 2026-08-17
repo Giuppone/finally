@@ -31,11 +31,19 @@ test.describe("portfolio visualisations", () => {
 
     await tradeViaBar(page, "SLV", 5, "buy");
 
-    // A snapshot is written immediately after every trade, so the chart does not have to
-    // wait out the 30s background interval to have something to draw.
-    await expect
-      .poll(async () => chart.locator("svg").count(), { timeout: 20_000 })
-      .toBeGreaterThan(0);
+    // TWO trades, a beat apart, on purpose. A snapshot is written immediately after every
+    // trade, but `_snapshot` skips one whose total value has not moved by more than half a
+    // cent — and a trade barely moves total value, since the cash leaving equals the
+    // position arriving. So the first buy writes the one point a fresh account has, and the
+    // second only writes because prices ticked in between. One point is not a line.
+    //
+    // Waiting on the 30s background snapshot task for that second point instead is what used
+    // to make this spec flaky: whether it passed depended on where the trade happened to
+    // land inside that 30s cycle.
+    await page.waitForTimeout(1_500);
+    await tradeViaBar(page, "SLV", 1, "buy");
+
+    await expect.poll(async () => chart.locator("svg").count()).toBeGreaterThan(0);
     await expect(chart.locator("path.recharts-area-area")).toBeVisible();
   });
 

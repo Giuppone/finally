@@ -41,8 +41,23 @@ services:
         # Gated on real readiness — schema applied AND market task ticking — so the first
         # spec does not race the seed watchlist into existence.
         condition: service_healthy
+    # Share the app's network namespace, so the browser reaches it on LOOPBACK.
+    #
+    # This is not a convenience: current Chromium auto-upgrades http:// to https:// for every
+    # host except localhost, so `http://app:8000` — the obvious compose-service URL, and what
+    # this file used to set — fails every single spec with ERR_SSL_PROTOCOL_ERROR before a
+    # request leaves the browser. Plain HTTP is correct here (one container, one port,
+    # PLAN.md §3) and a service name has no certificate to present, so that upgrade can only
+    # fail — and it fails HARD rather than falling back, because uvicorn answers the TLS
+    # ClientHello with plain HTTP, which Chromium reports as ERR_SSL_PROTOCOL_ERROR instead
+    # of a connection error. `--disable-features=HttpsUpgrades` was tried and did not work.
+    # 127.0.0.1 is trusted unconditionally and always will be.
+    #
+    # Consequence for the specs: `context.setOffline()` cannot cut the price stream over
+    # loopback, so tests/sse-resilience.spec.ts intercepts the SSE route instead.
+    network_mode: "service:app"
     environment:
-      BASE_URL: http://app:8000
+      BASE_URL: http://127.0.0.1:8000
       CI: "true"
     volumes:
       - .:/e2e

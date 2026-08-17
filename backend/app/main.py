@@ -14,7 +14,7 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
-from . import chat, db, routes
+from . import analytics, chat, db, routes
 from .market import PriceCache, build_market_service
 from .market import router as market_router
 from .portfolio import SnapshotTask
@@ -58,6 +58,7 @@ app = FastAPI(title="FinAlly", lifespan=lifespan)
 app.include_router(market_router)
 app.include_router(routes.router)
 app.include_router(chat.router)
+app.include_router(analytics.router)
 
 
 @app.get("/api/health")

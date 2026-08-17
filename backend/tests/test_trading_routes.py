@@ -220,3 +220,170 @@ async def test_reset_waits_for_an_in_flight_trade(client: httpx.AsyncClient) -> 
     response = await pending
     assert response.status_code == 200
     assert response.json()["cash_balance"] == STARTING_CASH
+
+
+# ---- portfolio sessions (save / load) ---------------------------------------
+
+@pytest.mark.asyncio
+async def test_session_export_carries_cash_positions_and_watchlist(
+    client: httpx.AsyncClient,
+) -> None:
+    await client.post("/api/portfolio/trade",
+                      json={"ticker": "MU", "side": "buy", "quantity": 10})
+
+    document = (await client.get("/api/session")).json()
+    assert document["version"] == 1
+    assert document["cash_balance"] == STARTING_CASH - 10 * 100.0
+    assert document["positions"] == [{"ticker": "MU", "quantity": 10.0, "avg_cost": 100.0}]
+    assert set(document["watchlist"]) == set(SEED_WATCHLIST)
+    assert document["meta"]["mode"] == "simulated"
+
+
+@pytest.mark.asyncio
+async def test_session_round_trip_restores_the_exact_account(
+    client: httpx.AsyncClient,
+) -> None:
+    await client.post("/api/portfolio/trade",
+                      json={"ticker": "MU", "side": "buy", "quantity": 10})
+    await client.post("/api/portfolio/trade",
+                      json={"ticker": "AMD", "side": "buy", "quantity": 4})
+    await client.delete("/api/watchlist/SLV")
+    saved = (await client.get("/api/session")).json()
+
+    await client.post("/api/portfolio/reset")
+    assert (await client.get("/api/portfolio")).json()["cash_balance"] == STARTING_CASH
+
+    response = await client.post("/api/session", json=saved)
+    assert response.status_code == 200
+    assert response.json()["loaded"] == {"positions": 2, "watchlist": 9}
+
+    restored = (await client.get("/api/session")).json()
+    assert restored["cash_balance"] == saved["cash_balance"]
+    assert restored["positions"] == saved["positions"]
+    assert restored["watchlist"] == saved["watchlist"]
+
+
+@pytest.mark.asyncio
+async def test_session_load_preserves_avg_cost_when_the_price_has_moved(
+    client: httpx.AsyncClient, priced_service
+) -> None:
+    """The reason this is an endpoint and not a replay of trades: buying the position back
+    would fill at today's price and silently rewrite the cost basis — so every unrealised
+    P&L number in the restored account would be wrong."""
+    await client.post("/api/portfolio/trade",
+                      json={"ticker": "MU", "side": "buy", "quantity": 10})
+    saved = (await client.get("/api/session")).json()
+
+    priced_service._cache.apply(Tick("MU", 150.0, 0))
+    await client.post("/api/session", json=saved)
+
+    holding = (await client.get("/api/portfolio")).json()["positions"][0]
+    assert holding["avg_cost"] == 100.0            # saved cost, not the 150 fill
+    assert holding["price"] == 150.0
+    assert holding["unrealized_pnl"] == 500.0
+
+
+@pytest.mark.asyncio
+async def test_session_load_resyncs_the_tracked_set(
+    client: httpx.AsyncClient, priced_service
+) -> None:
+    saved = {"version": 1, "cash_balance": 5000.0,
+             "positions": [{"ticker": "MU", "quantity": 1, "avg_cost": 90.0}],
+             "watchlist": ["AMD"]}
+    await client.post("/api/session", json=saved)
+
+    # watchlist ∪ open positions (PLAN.md §6) — a restored position whose ticker is not
+    # watched must still tick, or its value silently freezes.
+    assert priced_service.tracked == {"AMD", "MU"}
+    assert await db.run(db.tracked_tickers) == {"AMD", "MU"}
+
+
+@pytest.mark.asyncio
+async def test_session_load_snapshots_so_the_pnl_chart_is_not_blank(
+    client: httpx.AsyncClient,
+) -> None:
+    await client.post("/api/session", json={
+        "version": 1, "cash_balance": 5000.0,
+        "positions": [{"ticker": "MU", "quantity": 10, "avg_cost": 90.0}],
+        "watchlist": ["MU"],
+    })
+    points = (await client.get("/api/portfolio/history")).json()["points"]
+    assert [p["total_value"] for p in points] == [6000.0]
+
+
+@pytest.mark.asyncio
+async def test_session_load_keeps_chat_history(client: httpx.AsyncClient) -> None:
+    """A load restores a portfolio. Deleting the conversation is `reset`'s job."""
+    await db.run(lambda conn: db.add_chat_message(conn, "user", "hello"))
+    await client.post("/api/session", json={
+        "version": 1, "cash_balance": 1.0, "positions": [], "watchlist": [],
+    })
+    assert len(await db.run(db.chat_messages)) == 1
+
+
+@pytest.mark.asyncio
+async def test_session_load_normalizes_tickers(client: httpx.AsyncClient) -> None:
+    await client.post("/api/session", json={
+        "version": 1, "cash_balance": 0.0,
+        "positions": [{"ticker": " mu ", "quantity": 2, "avg_cost": 10.0}],
+        "watchlist": ["amd"],
+    })
+    document = (await client.get("/api/session")).json()
+    assert document["positions"][0]["ticker"] == "MU"
+    assert document["watchlist"] == ["AMD"]
+
+
+@pytest.mark.asyncio
+async def test_session_load_rejects_a_duplicate_position(
+    client: httpx.AsyncClient,
+) -> None:
+    """Merging them would invent an average cost the user never held."""
+    response = await client.post("/api/session", json={
+        "version": 1, "cash_balance": 0.0, "watchlist": [],
+        "positions": [{"ticker": "MU", "quantity": 1, "avg_cost": 10.0},
+                      {"ticker": "mu", "quantity": 2, "avg_cost": 20.0}],
+    })
+    assert response.status_code == 400
+    assert "duplicate" in response.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_session_load_rejects_an_unknown_version(client: httpx.AsyncClient) -> None:
+    response = await client.post("/api/session", json={
+        "version": 99, "cash_balance": 0.0, "positions": [], "watchlist": [],
+    })
+    assert response.status_code == 400
+    assert "version" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", [
+    {"cash_balance": -1.0, "positions": [], "watchlist": []},
+    {"cash_balance": 0.0, "watchlist": [],
+     "positions": [{"ticker": "MU", "quantity": 0, "avg_cost": 10.0}]},
+    {"cash_balance": 0.0, "watchlist": [],
+     "positions": [{"ticker": "MU", "quantity": -5, "avg_cost": 10.0}]},
+])
+async def test_session_load_rejects_impossible_documents(
+    client: httpx.AsyncClient, bad: dict
+) -> None:
+    """A zero-quantity row is the phantom position a full sell deletes (Review.md B11);
+    restoring one would put it straight back."""
+    assert (await client.post("/api/session", json=bad)).status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_session_load_waits_for_an_in_flight_trade(
+    client: httpx.AsyncClient,
+) -> None:
+    """Same hazard as reset (Back_end_review.md P1): a trade already past its price read
+    would otherwise commit on top of the just-restored tables."""
+    async with portfolio.trade_lock():
+        pending = asyncio.create_task(client.post("/api/session", json={
+            "version": 1, "cash_balance": 42.0, "positions": [], "watchlist": [],
+        }))
+        await asyncio.sleep(0.05)
+        assert not pending.done(), "session load ran while a trade held the lock"
+
+    assert (await pending).status_code == 200
+    assert (await client.get("/api/portfolio")).json()["cash_balance"] == 42.0

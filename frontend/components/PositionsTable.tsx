@@ -7,16 +7,40 @@ export function PositionsTable({
   positions,
   selected,
   onSelect,
+  onAnalyze,
 }: {
   positions: LivePosition[];
   selected: string | null;
   onSelect: (ticker: string) => void;
+  /** Opens the analytics drawer on the given tab. Both buttons share one surface. */
+  onAnalyze: (tab: "risk" | "rebalance") => void;
 }) {
   return (
     <section className="panel flex min-h-0 flex-col">
       <div className="panel-title">
         <span>Positions</span>
-        <span className="tnum text-faint">{positions.length}</span>
+        {/* The two analytics entry points live on the positions header because that is what
+            they act on. They stay enabled with an empty book: the drawer's own selection can
+            model names the user does not hold yet. */}
+        <div className="flex items-center gap-1">
+          <button
+            type="button"
+            className="btn btn-ghost !py-1"
+            onClick={() => onAnalyze("risk")}
+            data-testid="open-risk"
+          >
+            Risk &amp; return
+          </button>
+          <button
+            type="button"
+            className="btn btn-ghost !py-1"
+            onClick={() => onAnalyze("rebalance")}
+            data-testid="open-rebalance"
+          >
+            Suggest rebalance
+          </button>
+          <span className="tnum pl-1 text-faint">{positions.length}</span>
+        </div>
       </div>
 
       <div className="min-h-0 flex-1 overflow-auto">

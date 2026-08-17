@@ -97,7 +97,13 @@ finally/
 │   ├── start_mac.sh          # Launch Docker container (macOS/Linux)
 │   ├── stop_mac.sh           # Stop Docker container (macOS/Linux)
 │   ├── start_windows.ps1     # Launch Docker container (Windows PowerShell)
-│   └── stop_windows.ps1      # Stop Docker container (Windows PowerShell)
+│   ├── stop_windows.ps1      # Stop Docker container (Windows PowerShell)
+│   ├── lib_portfolio_tool.{sh,ps1}      # Shared runner for the four harness scripts
+│   ├── equal_weight_portfolio.{sh,ps1}  # Seed an equal-dollar-weight book
+│   ├── start_random_portfolio.{sh,ps1}  # Seed a reproducible, lopsided random book
+│   ├── save_session.{sh,ps1}            # Portfolio state -> sessions/NAME.json
+│   └── load_session.{sh,ps1}            # sessions/NAME.json -> portfolio state
+├── sessions/                 # Saved portfolio sessions (JSON, hand-editable)
 ├── test/                     # Playwright E2E tests + docker-compose.test.yml
 ├── db/                       # Volume mount target (SQLite file lives here at runtime)
 │   └── .gitkeep              # Directory exists in repo; finally.db is gitignored
@@ -299,6 +305,19 @@ Seed entries are bare exchange symbols — no company names, no punctuation — 
 | GET | `/api/portfolio/history` | Portfolio value snapshots over time (for P&L chart) |
 | POST | `/api/portfolio/reset` | Back to $10,000, the seed watchlist, and no history. E2E needs it — the fresh-start scenario fails on a second run against a persisted volume otherwise — and it is the escape hatch when a demo's LLM drains the account. Runs under the same trade lock as `/api/portfolio/trade`, so it can never interleave with an in-flight trade |
 
+### Analytics
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/api/analytics/risk` | Volatility, expected return, Sharpe, VaR and the per-name risk decomposition for a weight vector. Read-only; empty `holdings` means the live portfolio |
+| POST | `/api/analytics/rebalance` | Suggests target weights (`min_variance`, `risk_parity`, `max_sharpe`, `equal_weight`) and the ordered trades that reach them. **Suggests only — executes nothing** |
+| POST | `/api/portfolio/rebalance` | Executes a suggested trade list. The whole batch runs under one hold of the trade lock, so nothing interleaves between the sells and the buys. A partial batch is a valid outcome, per §9 |
+
+### Sessions
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/session` | Export cash, positions (with average costs) and the watchlist as one JSON document |
+| POST | `/api/session` | Restore such a document, replacing the current portfolio. Exists because a load is **not** expressible through the trade API: replaying positions as market orders fills at today's price and silently rewrites every cost basis and the cash balance. Same trade lock as `/api/portfolio/reset`. Clears trades and P&L snapshots (they describe an account that no longer exists); keeps chat history. See `REBALANCE_TEST_HARNESS.md` §6 |
+
 ### Watchlist
 | Method | Path | Description |
 |--------|------|-------------|
@@ -402,6 +421,7 @@ The frontend is a single-page application with a dense, terminal-inspired layout
 - **P&L chart** — line chart showing total portfolio value over time, using data from `portfolio_snapshots`
 - **Positions table** — tabular view of all positions: ticker, quantity, avg cost, current price, unrealized P&L, % change
 - **Trade bar** — simple input area: ticker field, quantity field, buy button, sell button. Market orders, instant fill.
+- **Analytics drawer** — opened by the **Risk & Return** and **Suggest Rebalance** buttons on the positions header. Two tabs over one selection: a risk/return scatter with the portfolio marked, weight-vs-risk-share bars, and a current-vs-target rebalance preview with the ordered trade list and an explicit Apply. See `PORTFOLIO_ANALYTICS.md`
 - **AI chat panel** — docked/collapsible sidebar. Message input, scrolling conversation history, loading indicator while waiting for LLM response. Trade executions and watchlist changes shown inline as confirmations.
 - **Header** — portfolio total value (updating live), connection status indicator, cash balance
 

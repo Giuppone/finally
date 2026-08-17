@@ -215,6 +215,71 @@ async def execute_trade(
     return result
 
 
+async def execute_batch(
+    legs: list[tuple[str, str, float]],
+    service: MarketDataService,
+    user_id: str = DEFAULT_USER,
+) -> list[TradeResult]:
+    """Execute a whole rebalance under ONE hold of the trade lock.
+
+    Looping `execute_trade` from the browser would work and reuse the same validation, but
+    it takes and releases the lock per leg - so a chat-driven trade can interleave between
+    them and the plan's arithmetic quietly stops holding. Taking it once means the batch
+    sees one consistent account from first sell to last buy.
+
+    A partial batch is a valid outcome (PLAN.md §9): earlier fills stand, and the first
+    failure and every leg after it come back with their reason. Prices are resolved BEFORE
+    the lock, because a LIVE-mode anchor fetch inside it would serialise every other trade
+    in the app behind a network call.
+    """
+    prices: dict[str, float] = {}
+    prepared: list[tuple[str, str, float]] = []
+    for ticker, side, quantity in legs:
+        try:
+            symbol = normalize_ticker(ticker)
+        except InvalidTicker as exc:
+            prepared.append((str(ticker), side, quantity))
+            prices[str(ticker)] = float("nan")
+            log.warning("rebalance leg rejected: %s", exc)
+            continue
+        if symbol not in prices:
+            quote = service.quote(symbol) or await service.add_ticker(symbol)
+            if quote is not None:
+                prices[symbol] = quote.price
+        prepared.append((symbol, side, quantity))
+
+    results: list[TradeResult] = []
+    async with trade_lock():
+        for symbol, side, quantity in prepared:
+            checked, error = validate_quantity(quantity)
+            if checked is None:
+                results.append(_rejected(symbol, side, 0.0, "invalid_quantity",
+                                         error or "invalid quantity"))
+                continue
+            if side not in ("buy", "sell"):
+                results.append(_rejected(symbol, side, checked, "invalid_side",
+                                         f"unknown side: {side!r}"))
+                continue
+            price = prices.get(symbol)
+            if price is None or price != price:            # None or NaN
+                results.append(_rejected(symbol, side, checked, "no_price",
+                                         f"no market data available for {symbol}"))
+                continue
+            results.append(await db.run(
+                lambda conn, s=symbol, sd=side, q=checked, p=price:
+                _apply(conn, s, sd, q, p, user_id)
+            ))
+
+        if any(result.filled for result in results):
+            tracked = await db.run(lambda conn: db.tracked_tickers(conn, user_id))
+            await service.sync_tracked(tracked)
+            await snapshot_now(service, user_id)
+
+    filled = sum(1 for result in results if result.filled)
+    log.info("rebalance batch: %d/%d filled", filled, len(results))
+    return results
+
+
 def _apply(conn: sqlite3.Connection, ticker: str, side: str, quantity: float,
            fill_price: float, user_id: str) -> TradeResult:
     """Read, validate and write inside ONE transaction (Review.md B13)."""

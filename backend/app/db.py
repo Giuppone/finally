@@ -262,6 +262,52 @@ def reset(conn: sqlite3.Connection, user_id: str = DEFAULT_USER) -> None:
         seed_defaults(conn, user_id, force=True)   # restoring the seed watchlist is the point
 
 
+def import_session(conn: sqlite3.Connection, *, cash: float,
+                   holdings: list[tuple[str, float, float]], tickers: list[str],
+                   user_id: str = DEFAULT_USER) -> None:
+    """Replace the portfolio with a saved session: cash, positions, watchlist. One
+    transaction, so a rejected document can never leave a half-restored account.
+
+    `trades` and `portfolio_snapshots` are cleared. They record how the account reached a
+    state it is no longer in; a P&L chart splicing the old account's values onto the
+    restored one is worse than an empty chart, and a blotter of trades that did not
+    produce the current positions is simply wrong.
+
+    `chat_messages` is deliberately LEFT ALONE. This restores a portfolio, and silently
+    deleting the conversation is not something a load button should do — `reset` is the
+    full wipe.
+    """
+    now = clock.now_iso()
+    with transaction(conn):
+        for table in ("positions", "trades", "portfolio_snapshots", "watchlist"):
+            conn.execute(f"DELETE FROM {table} WHERE user_id = ?", (user_id,))
+
+        # The profile row normally exists (init seeds it and `reset` updates in place), but
+        # an UPDATE against a missing row silently succeeds with rowcount 0 — which would
+        # restore the positions and quietly keep the old cash.
+        conn.execute(
+            "INSERT OR IGNORE INTO users_profile (id, cash_balance, created_at) "
+            "VALUES (?, ?, ?)",
+            (user_id, cash, now),
+        )
+        conn.execute(
+            "UPDATE users_profile SET cash_balance = ? WHERE id = ?", (cash, user_id)
+        )
+
+        for ticker in tickers:
+            conn.execute(
+                "INSERT OR IGNORE INTO watchlist (id, user_id, ticker, added_at) "
+                "VALUES (?, ?, ?, ?)",
+                (str(uuid.uuid4()), user_id, ticker, now),
+            )
+        for ticker, quantity, avg_cost in holdings:
+            conn.execute(
+                "INSERT INTO positions (id, user_id, ticker, quantity, avg_cost, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (str(uuid.uuid4()), user_id, ticker, quantity, avg_cost, now),
+            )
+
+
 def stats(conn: sqlite3.Connection) -> dict[str, Any]:
     """Health fragment: enough to tell 'schema applied' from 'empty file'."""
     tables = {
