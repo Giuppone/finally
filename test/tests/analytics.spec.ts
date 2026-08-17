@@ -91,6 +91,54 @@ test.describe("portfolio analytics", () => {
     expect(shares.reduce((sum, share) => sum + share, 0)).toBeCloseTo(100, 0);
   });
 
+  test("the risk map plots the efficient frontier and says where you sit on it", async ({
+    page,
+    request,
+  }) => {
+    await seedPortfolio(request, equalWeights(BASKET));
+    await page.goto("/");
+    await waitForStream(page);
+    await openAnalytics(page, "risk");
+
+    // Both axes are labelled — a scatter of unlabelled percentages is a puzzle, not a chart.
+    const scatter = page.getByTestId("risk-scatter");
+    await expect(scatter).toContainText("annualised volatility");
+    await expect(scatter).toContainText("Expected return");
+    await expect(scatter).toContainText("Efficient frontier");
+
+    // The curve itself: Recharts draws the connecting line as a path in the scatter's line
+    // layer, so its absence means the frontier came back empty.
+    await expect(
+      scatter.locator("path.recharts-curve").first(),
+    ).toBeVisible();
+
+    // And the sentence that actually answers "how far from optimal am I?".
+    await expect(page.getByTestId("frontier-gap")).toContainText(
+      /sits (inside|on) the frontier/,
+    );
+  });
+
+  test("an equal-weight book is measurably inside the frontier", async ({ request }) => {
+    // Equal weight looks sensible and is not optimal — which is the reason to draw the curve
+    // at all. Asserted through the API so the numbers are exact rather than rendered.
+    await seedPortfolio(request, equalWeights(BASKET));
+    const stats = await (
+      await request.post("/api/analytics/risk", { data: {} })
+    ).json();
+
+    expect(stats.frontier.length).toBeGreaterThan(5);
+    expect(stats.frontier_gap.avoidable_volatility).toBeGreaterThan(0);
+    expect(stats.frontier_gap.forgone_return).toBeGreaterThan(0);
+
+    // Monotone: more risk, more return, all the way along.
+    for (let i = 1; i < stats.frontier.length; i += 1) {
+      expect(stats.frontier[i].volatility).toBeGreaterThan(stats.frontier[i - 1].volatility);
+      expect(stats.frontier[i].expected_return).toBeGreaterThan(
+        stats.frontier[i - 1].expected_return,
+      );
+    }
+  });
+
   test("expected return is never shown without its basis", async ({ page, request }) => {
     // The drift is the simulator's damped value, not a forecast. An unlabelled number here
     // would be the one genuinely misleading thing this panel could do.

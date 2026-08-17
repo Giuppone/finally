@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import random
 
+import pytest
+
+from scripts import portfolio_tool
 from scripts.portfolio_tool import (
     MIN_NOTIONAL,
     equal_weights,
@@ -102,3 +105,77 @@ def test_dust_legs_are_dropped() -> None:
     )
     assert [order.ticker for order in orders] == ["MU"]
     assert any(f"${MIN_NOTIONAL:.0f}" in warning for warning in warnings)
+
+
+# ---- --dry-run must not write ------------------------------------------------
+
+class RecordingApi:
+    """Stands in for `Api`, recording every call so a test can assert on the verbs."""
+
+    PRICES = {"MU": 100.0, "AMD": 50.0, "SLV": 25.0}
+
+    def __init__(self, base: str, timeout: float = 20.0) -> None:
+        self.base = base
+        self.calls: list[tuple[str, str]] = []
+
+    def get(self, path: str) -> dict:
+        self.calls.append(("GET", path))
+        if path == "/api/health":
+            return {"status": "ok"}
+        if path == "/api/watchlist":
+            return {"tickers": [{"ticker": t, "priced": True, "price": p}
+                                for t, p in self.PRICES.items()]}
+        if path == "/api/portfolio":
+            return {"cash_balance": 10_000.0, "positions": [], "positions_value": 0.0,
+                    "total_value": 10_000.0}
+        raise AssertionError(f"unexpected GET {path}")
+
+    def post(self, path: str, payload: dict | None = None) -> dict:
+        self.calls.append(("POST", path))
+        return {}
+
+
+def run_cli(monkeypatch: pytest.MonkeyPatch, argv: list[str]) -> RecordingApi:
+    recorded: list[RecordingApi] = []
+
+    def factory(base: str, timeout: float = 20.0) -> RecordingApi:
+        api = RecordingApi(base, timeout)
+        recorded.append(api)
+        return api
+
+    monkeypatch.setattr(portfolio_tool, "Api", factory)
+    args = portfolio_tool.build_parser().parse_args(argv)
+    assert args.func(args) == 0
+    return recorded[0]
+
+
+@pytest.mark.parametrize("mode", ["equal", "random"])
+def test_dry_run_sends_no_writes(monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
+    """`--dry-run` says "print the plan, send no writes" and has to mean it.
+
+    It did not: the reset ran before the plan was ever printed, so the flag a user reaches
+    for to try the script safely was the one that emptied their account.
+    """
+    api = run_cli(monkeypatch, [mode, "--dry-run", "--yes"])
+    assert [call for call in api.calls if call[0] == "POST"] == []
+    assert ("GET", "/api/health") in api.calls
+
+
+def test_dry_run_does_not_add_tickers_to_the_watchlist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other write hiding in the same path: an unwatched --tickers entry was POSTed
+    to the watchlist before the plan was printed."""
+    api = run_cli(monkeypatch, ["equal", "--dry-run", "--yes", "--tickers", "MU,NVDA"])
+    assert [call for call in api.calls if call[0] == "POST"] == []
+
+
+def test_a_real_run_does_reset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The guard must not have turned the reset off for everyone."""
+    api = run_cli(monkeypatch, ["equal", "--yes"])
+    assert ("POST", "/api/portfolio/reset") in api.calls
+
+
+def test_no_reset_skips_the_reset(monkeypatch: pytest.MonkeyPatch) -> None:
+    api = run_cli(monkeypatch, ["equal", "--yes", "--no-reset"])
+    assert ("POST", "/api/portfolio/reset") not in api.calls

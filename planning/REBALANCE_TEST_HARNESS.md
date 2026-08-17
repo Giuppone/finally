@@ -21,7 +21,7 @@ state repeatable across restarts and shareable as a file.
 | `scripts/load_session.sh` / `.ps1` | wrapper → `portfolio_tool.py load` |
 | `backend/app/routes.py` | `GET /api/session`, `POST /api/session` (§6) |
 | `backend/app/db.py` | `import_session()` — the transactional restore |
-| `backend/tests/test_portfolio_tool.py` | 11 tests: the pure allocation functions |
+| `backend/tests/test_portfolio_tool.py` | 16 tests: the pure allocation functions, plus the --dry-run write guard |
 | `backend/tests/test_trading_routes.py` | 13 added tests: session export/import |
 | `sessions/` | where saved sessions land; **not gitignored** — a session file is a legitimate test fixture |
 
@@ -40,7 +40,8 @@ contains a single line of allocation logic. The developer machine here is Window
 files cover Git Bash, macOS and CI containers. Verified: the same `--seed 7` produces the identical book
 from both shells.
 
-Three PowerShell-specific notes, each of which was a real failure mode:
+Four PowerShell-specific notes, each of which was a real failure mode, and the last two were found
+only by running the thing:
 
 - **No `param()` block in the wrappers.** Every flag belongs to the Python tool; a `param` block makes
   PowerShell try to bind `--yes` itself and fail. `$args` passes through verbatim.
@@ -49,6 +50,11 @@ Three PowerShell-specific notes, each of which was a real failure mode:
   printed under a stack trace.
 - **The Store `python.exe` stub.** Windows ships a fake `python.exe` that exits without running
   anything, so `Get-FinallyRunner` probes `sys.version_info` rather than trusting that the name resolves.
+- **The comma is PowerShell's ARRAY operator.** `--tickers MU,AMD,SLV` arrives as a *nested array*, and
+  binding it to a `[string[]]` parameter stringifies it space-joined — so the tool received one ticker
+  named `"MU AMD SLV"` and reported it unpriced. `Invoke-PortfolioTool` takes `[object[]]` and re-joins
+  any array element with commas, which reproduces exactly what was typed. Quoted (`"MU,AMD,SLV"`) and
+  unquoted forms now behave identically; both are verified.
 
 **Executable bit:** `core.fileMode` is `false` in this repo and the existing `start_mac.sh` is committed
 `100644`, so the `.sh` files land non-executable too. On macOS/Linux run them as `bash scripts/…sh` or
@@ -79,7 +85,7 @@ The third works because the Dockerfile's `COPY backend/ ./` already carries `bac
 image at `/app/scripts/`. No Dockerfile change is needed. The `--base` override is **prepended**, not
 appended, so a user-supplied `--base` still wins — argparse takes the last occurrence.
 
-### Two things the smoke run actually caught
+### Three things running it actually caught
 
 1. **A Windows console cannot print `≈` or `—`.** The default code page is cp1252 and
    `UnicodeEncodeError` killed the script *after* the trades had already gone through, leaving a
@@ -88,6 +94,11 @@ appended, so a user-supplied `--base` still wins — argparse takes the last occ
 2. **`sys.stdin.isatty()` is not a reliable "someone can answer" test under Git Bash.** With stdin
    redirected from `/dev/null` it still reported a terminal, so `input()` died on `EOFError` with a
    traceback instead of the one line telling the user to pass `--yes`. `confirm()` now catches both.
+3. **`--dry-run` reset the portfolio.** The flag documents "print the plan, execute nothing", and it did
+   print the plan — after `POST /api/portfolio/reset` had already emptied the account, and after any
+   unwatched `--tickers` entry had been POSTed to the watchlist. The one flag a cautious user reaches
+   for first was the most destructive way to try the script. Guarded now, with four tests in
+   `test_portfolio_tool.py` that fail against the old code.
 
 ---
 

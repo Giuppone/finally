@@ -14,7 +14,12 @@ param(
     [int]$Port = 8000
 )
 
-$ErrorActionPreference = "Stop"
+# NOT "Stop". Every docker command here writes progress to stderr, and under `Stop`
+# PowerShell 5.1 promotes a native command's stderr to a terminating NativeCommandError —
+# so `-Build` died on the first line docker printed, before it had built anything. Each
+# docker call below already checks $LASTEXITCODE, which is the reliable signal for a native
+# executable; "Stop" only added a way to fail on success.
+$ErrorActionPreference = "Continue"
 
 $Image     = "finally:latest"
 $Container = "finally"

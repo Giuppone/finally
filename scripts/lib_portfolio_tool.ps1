@@ -56,8 +56,24 @@ function Get-FinallyRunner {
 function Invoke-PortfolioTool {
     param(
         [Parameter(Mandatory = $true)][string]$Command,
-        [string[]]$Arguments = @()
+        # [object[]], not [string[]]: see the flattening below. Binding to [string[]] is
+        # what destroys a comma-separated value, and it happens before any code here runs.
+        [object[]]$Arguments = @()
     )
+
+    # In PowerShell the comma is the ARRAY operator, so `--tickers MU,AMD,SLV` reaches this
+    # function as a nested array, not as one string. Stringified the usual way that becomes
+    # "MU AMD SLV" - space-joined - and the tool then looks up a single ticker by that name
+    # and reports it unpriced. Re-joining with commas reproduces exactly what was typed, and
+    # leaves every other argument untouched.
+    $flat = @(foreach ($argument in $Arguments) {
+        if ($argument -is [System.Array]) {
+            ($argument | ForEach-Object { "$_" }) -join ","
+        }
+        else {
+            "$argument"
+        }
+    })
 
     $runner = Get-FinallyRunner -Root $FinallyRepoRoot
 
@@ -89,6 +105,6 @@ tool yourself with an explicit --file inside the container).
         $argv += @("--base", "http://127.0.0.1:8000")
     }
 
-    & $runner[0] @argv @Arguments
+    & $runner[0] @argv @flat
     exit $LASTEXITCODE
 }

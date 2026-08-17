@@ -228,16 +228,22 @@ def watchlist_prices(api: Api) -> dict[str, float]:
 
 
 def resolve_tickers(api: Api, requested: str | None, count: int | None,
-                    rng: random.Random) -> list[str]:
+                    rng: random.Random, allow_writes: bool = True) -> list[str]:
     """The watchlist, or `--tickers` (adding any that are not watched yet)."""
     watched = [entry["ticker"] for entry in api.get("/api/watchlist")["tickers"]]
 
     if requested:
         wanted = [t.strip().upper() for t in requested.split(",") if t.strip()]
         for ticker in wanted:
-            if ticker not in watched:
-                # Also what pulls it into the tracked set and gives it a price (PLAN.md §6).
-                api.post("/api/watchlist", {"ticker": ticker})
+            if ticker in watched:
+                continue
+            if not allow_writes:
+                # Adding it is a write. Left off the watchlist it has no price either, so
+                # the plan will show it skipped rather than silently sized against nothing.
+                print(f"  ! {ticker} is not watched; a real run would add it first")
+                continue
+            # Also what pulls it into the tracked set and gives it a price (PLAN.md §6).
+            api.post("/api/watchlist", {"ticker": ticker})
         return wanted
 
     if count is not None and count < len(watched):
@@ -284,7 +290,12 @@ def cmd_seed(args: argparse.Namespace) -> int:
     rng = random.Random(args.seed)
     wait_healthy(api)
 
-    if not args.no_reset:
+    # --dry-run means NO writes AT ALL, and that has to include the reset and the watchlist
+    # additions below - both of which used to run before the plan was ever printed. A flag
+    # that promises to change nothing and then empties the account is worse than no flag.
+    if args.dry_run:
+        print("dry run: nothing will be written")
+    elif not args.no_reset:
         confirm("Reset the portfolio to $10,000 and the seed watchlist? "
                 "Positions, trades and P&L history will be deleted.", args.yes)
         api.post("/api/portfolio/reset")
@@ -293,7 +304,7 @@ def cmd_seed(args: argparse.Namespace) -> int:
     # A random book over all ten names is barely lopsided; six is enough to be visibly
     # concentrated and still worth diversifying.
     count = args.count if args.count is not None else (6 if args.mode == "random" else None)
-    tickers = resolve_tickers(api, args.tickers, count, rng)
+    tickers = resolve_tickers(api, args.tickers, count, rng, allow_writes=not args.dry_run)
     if not tickers:
         raise ApiError("no tickers to allocate across")
 

@@ -137,6 +137,27 @@ async def post_risk(
 
     stats = risk.portfolio_stats(tickers, weights, cash_weight=cash_weight,
                                  total_value=total_value)
+
+    # The frontier rides along with the Risk tab only: the rebalance tab compares two
+    # concrete portfolios, where a curve neither of them sits on is noise.
+    if len(tickers) >= 2:
+        curve = await risk.frontier_for(tuple(tickers))
+        stats["frontier"] = [{"volatility": round(v, 6), "expected_return": round(r, 6)}
+                             for v, r in curve]
+        # Measured against the risky sleeve renormalised to 1. The frontier is a property of
+        # the SELECTION, not of how much cash sits beside it, and a half-cash book compared
+        # against it raw would be reported as implausibly far inside a curve it was never on.
+        risky = sum(weights)
+        if risky > 1e-9:
+            scaled = [w / risky for w in weights]
+            cov = estimates.covariance(tickers)
+            mu = estimates.drifts(tickers)
+            stats["frontier_gap"] = optimize.frontier_gap(
+                risk.portfolio_volatility(cov, scaled),
+                sum(w * m for w, m in zip(scaled, mu)),
+                list(curve),
+            )
+
     return stats | {"warnings": warnings}
 
 

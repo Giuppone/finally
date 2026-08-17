@@ -50,6 +50,10 @@ export function RiskReport({ stats }: { stats: RiskStats }) {
   const riskiest = [...stats.positions].sort((a, b) => b.risk_share - a.risk_share)[0];
   const mismatch = heaviest && riskiest && heaviest.ticker !== riskiest.ticker;
 
+  // Absent for a single-name selection, where "the frontier" is just that one point.
+  const gap =
+    "avoidable_volatility" in stats.frontier_gap ? stats.frontier_gap : null;
+
   return (
     <div className="flex flex-col gap-3" data-testid="risk-report">
       <div className="grid grid-cols-3 gap-2">
@@ -115,6 +119,25 @@ export function RiskReport({ stats }: { stats: RiskStats }) {
           Risk / return map
         </h3>
         <RiskScatter stats={stats} />
+        {gap && (
+          <p className="mt-1 text-2xs text-muted" data-testid="frontier-gap">
+            {gap.avoidable_volatility < 0.005 && gap.forgone_return < 0.005 ? (
+              <>Your portfolio sits <span className="text-up">on the frontier</span> — no
+              reshuffle of these names improves it on either axis.</>
+            ) : (
+              <>
+                Your portfolio sits inside the frontier. At the same expected return the
+                lowest achievable risk is{" "}
+                <span className="text-ink">{pct(gap.volatility_at_same_return)}</span>, so{" "}
+                <span className="text-accent">{pct(gap.avoidable_volatility)}</span> of
+                volatility is avoidable; at the same risk the best achievable return is{" "}
+                <span className="text-ink">{pct(gap.return_at_same_volatility)}</span>,{" "}
+                <span className="text-accent">{pct(gap.forgone_return)}</span> above where
+                you are.
+              </>
+            )}
+          </p>
+        )}
       </section>
 
       <section>

@@ -9,8 +9,49 @@ from __future__ import annotations
 
 import math
 
+import asyncio
+
 from ..market.simulator import correlation_matrix
-from . import estimates
+from . import estimates, optimize
+
+# Enough to read as a smooth curve at the size the panel renders it; every extra point is
+# another warm-started solve.
+FRONTIER_POINTS = 32
+
+_FRONTIER_CACHE: dict[tuple[tuple[str, ...], float, int],
+                      tuple[tuple[float, float], ...]] = {}
+
+
+async def frontier_for(tickers: tuple[str, ...], cap: float = 1.0,
+                       points: int = FRONTIER_POINTS) -> tuple[tuple[float, float], ...]:
+    """The frontier for a ticker set, memoised, computed without blocking the event loop.
+
+    **Not `asyncio.to_thread`.** Tracing the frontier is ~48 solves of pure Python, which
+    holds the GIL throughout - handing it to a worker thread relocates the stall without
+    removing it, and the price stream stutters exactly as much. That was measured: the E2E
+    suite went from 47s to over four minutes, with specs that never touch analytics slowing
+    down too. Yielding between solves is what actually works; each one is ~12ms, invisible
+    against a 500ms tick.
+
+    Cached indefinitely because it depends on nothing that moves: sigma, mu and the
+    correlations all come from `seeds.py`, which is a data file. Prices tick, the frontier
+    does not - only the marker showing where the portfolio sits on it does.
+    """
+    key = (tickers, cap, points)
+    cached = _FRONTIER_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    cov = estimates.covariance(list(tickers))
+    mu = estimates.drifts(list(tickers))
+    curve: list[tuple[float, float]] = []
+    for point in optimize.frontier_steps(mu, cov, cap, points):
+        curve.append(point)
+        await asyncio.sleep(0)
+
+    result = tuple(optimize.efficient_only(curve))
+    _FRONTIER_CACHE[key] = result
+    return result
 
 
 def matvec(matrix: list[list[float]], vector: list[float]) -> list[float]:

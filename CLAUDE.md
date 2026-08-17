@@ -8,9 +8,9 @@ The key document is PLAN.md included in full below. Section 13 is a decision rec
 
 **All twelve sections of PLAN.md are implemented.** The app builds, runs in Docker and serves a working trading terminal at `http://localhost:8000`.
 
-- **Backend** (§6–§9): database + schema, the market-data package (three modes — see PLAN.md §13 item 9), SSE streaming, price cache with ring buffer, trading/portfolio/watchlist endpoints, portfolio-session save/load (`GET`/`POST /api/session`), the analytics package (`app/analytics/` — risk decomposition and rebalance suggestions, PORTFOLIO_ANALYTICS.md), 30s P&L snapshots, and the LLM chat package (`app/chat/`). `cd backend && uv run pytest -q` → **299 passed**.
+- **Backend** (§6–§9): database + schema, the market-data package (three modes — see PLAN.md §13 item 9), SSE streaming, price cache with ring buffer, trading/portfolio/watchlist endpoints, portfolio-session save/load (`GET`/`POST /api/session`), the analytics package (`app/analytics/` — risk decomposition and rebalance suggestions, PORTFOLIO_ANALYTICS.md), 30s P&L snapshots, and the LLM chat package (`app/chat/`). `cd backend && uv run pytest -q` → **314 passed**.
 - **Frontend** (§10): `frontend/` is a Next.js 16 + React 19 + Tailwind static export using **Recharts** as the single charting dependency — the open question in PLAN.md §13 "Still open" is now decided, because Recharts covers the line chart, the sparklines *and* the treemap, while Lightweight Charts has no treemap.
-- **Packaging** (§11, §12): multi-stage `Dockerfile`, `docker-compose.yml`, start/stop scripts for macOS and Windows, and a Playwright E2E suite in `test/` (**35 specs, all passing**).
+- **Packaging** (§11, §12): multi-stage `Dockerfile`, `docker-compose.yml`, start/stop scripts for macOS and Windows, and a Playwright E2E suite in `test/` (**37 specs, all passing**).
 
 Design notes from the deleted first pass are in `planning/archive/`; consult them only when required. The current design docs are `MARKET_DATA_DESIGN.md`, `MARKET_INTERFACE.md`, `MARKET_SIMULATOR.md` and `MASSIVE_API.md`. Code reviews live in `Back_end_review.md` and `Market_data_review.md` — the three findings open at the time of those reviews (reset not serialised, duplicate snapshot rows, `add_ticker` perturbing other GBM paths) were **fixed on 2026-08-15**, each with a regression test.
 
@@ -35,11 +35,12 @@ docker build -t finally . && docker run -d --name finally -p 8000:8000 --env-fil
 # Backend only — also serves frontend/out if it has been built
 cd backend
 uv run uvicorn app.main:app --port 8000      # needs env vars; see PLAN.md §5
-uv run pytest -q                             # 299 tests
+uv run pytest -q                             # 314 tests
 uv run market_data_demo.py                   # live terminal dashboard, simulator
 uv run market_data_demo.py --live            # same, against the real Massive key
 
-# E2E against the real container, LLM_MOCK=true — 35 specs, ~47s after the image is built
+# E2E against the real container, LLM_MOCK=true — 37 specs (close other containers first;
+# a second app instance competing for CPU roughly doubles the wall time)
 docker compose -f test/docker-compose.test.yml up --build --exit-code-from playwright
 ```
 
@@ -67,8 +68,10 @@ Flags are the Python tool's, not PowerShell's — `--yes`, not `-Yes`. The wrapp
 `param()` block and do not set `$ErrorActionPreference = "Stop"`; both would mangle passthrough. Any
 shell can also skip the wrappers: `uv run python backend/scripts/portfolio_tool.py equal --yes`.
 
-The seeders and `load` reset/replace the portfolio, so they prompt unless `--yes`. Add
-`--base http://localhost:PORT` when the app is not on 8000. Everything the tool prints is ASCII — a
+These scripts do **not** start the app - they seed a portfolio into a running one, so bring the
+container up first (`.\scripts\start_windows.ps1`). The seeders and `load` reset/replace the portfolio,
+so they prompt unless `--yes`; `--dry-run` writes nothing at all. Add `--base http://localhost:PORT`
+when the app is not on 8000. Everything the tool prints is ASCII — a
 Windows cp1252 console cannot encode `≈` and crashed mid-run before that was fixed.
 
 The backend reads `os.environ` only and never parses `.env` (§5), so load the file into the environment before launching or it starts in `SIMULATED`. It also **fails fast** at startup without `OPENROUTER_API_KEY` unless `LLM_MOCK=true`.

@@ -16,6 +16,7 @@ import {
 import {
   AXIS_FONT,
   AXIS_TEXT,
+  FRONTIER,
   GRID,
   SERIES_ACTUAL,
   SERIES_MODEL,
@@ -30,19 +31,21 @@ interface Point {
   x: number;
   y: number;
   z: number;
-  weight: number;
 }
 
 /**
- * Where each holding sits in risk/return space, and where the portfolio lands.
+ * Where each holding sits in risk/return space, where the portfolio lands, and how far
+ * inside the efficient frontier that is.
  *
- * The portfolio point is the story: diversification pulls it left of the weighted average
- * of its holdings, and seeing it sit inside the cloud rather than on it is the clearest
- * statement of what correlation is doing.
+ * The frontier is the answer to "how good is this book?" — every point on it is the most
+ * return achievable at that risk, so the vertical gap between the portfolio marker and the
+ * curve is exactly the return being left on the table. Without it the scatter shows where
+ * you are with nothing to be relative to.
  *
  * Points are NOT coloured by ticker. Ten categorical hues is past the ~7 where adjacent
- * classes blur, and it would spend the whole palette on identity that the direct labels
- * already carry. One hue for holdings, one for the portfolio.
+ * classes blur, and it would spend the whole palette on identity the direct labels already
+ * carry. One hue for holdings, one for the portfolio, and a recessive neutral for the
+ * frontier — which is a reference curve, not a third series competing for attention.
  */
 export function RiskScatter({ stats }: { stats: RiskStats }) {
   const holdings: Point[] = stats.positions
@@ -52,7 +55,6 @@ export function RiskScatter({ stats }: { stats: RiskStats }) {
       x: position.volatility * 100,
       y: position.expected_return * 100,
       z: Math.max(position.weight, 0.01),
-      weight: position.weight,
     }));
 
   const portfolio: Point[] = [{
@@ -60,27 +62,32 @@ export function RiskScatter({ stats }: { stats: RiskStats }) {
     x: stats.volatility * 100,
     y: stats.expected_return * 100,
     z: 1,
-    weight: 1 - stats.cash_weight,
   }];
+
+  const frontier: Point[] = stats.frontier.map((point, index) => ({
+    ticker: `frontier-${index}`,
+    x: point.volatility * 100,
+    y: point.expected_return * 100,
+    z: 1,
+  }));
 
   if (holdings.length === 0) return null;
 
-  // 12% of the spread as breathing room on each end, so the outermost dot and its label
-  // both sit inside the plot rather than against the axis.
+  // 12% of the spread as breathing room on each end, so the outermost dot and its label both
+  // sit inside the plot rather than against the axis.
   const padded: [(min: number) => number, (max: number) => number] = [
     (min) => Math.max(0, min - Math.abs(min) * 0.12 - 1),
     (max) => max + Math.abs(max) * 0.12 + 1,
   ];
 
   return (
-    <div className="h-56" data-testid="risk-scatter">
+    <div className="h-64" data-testid="risk-scatter">
       <ResponsiveContainer width="100%" height="100%">
-        <ScatterChart margin={{ top: 14, right: 18, bottom: 26, left: 4 }}>
+        <ScatterChart margin={{ top: 14, right: 18, bottom: 30, left: 10 }}>
           <CartesianGrid stroke={GRID} strokeDasharray="" />
           {/* Padded data domains, not [0, max]. Volatility here runs 57-106% and drift
               2-20%, so anchoring either axis at zero spends most of the plot on empty space
-              and squeezes every point into one corner - which is exactly where the labels
-              then collide. */}
+              and squeezes every point into one corner. */}
           <XAxis
             type="number"
             dataKey="x"
@@ -91,9 +98,9 @@ export function RiskScatter({ stats }: { stats: RiskStats }) {
             tick={{ fill: AXIS_TEXT, fontSize: AXIS_FONT }}
             stroke={GRID}
             label={{
-              value: "annualised volatility %",
+              value: "Risk  —  annualised volatility (%)",
               position: "insideBottom",
-              offset: -16,
+              offset: -18,
               fill: AXIS_TEXT,
               fontSize: AXIS_FONT,
             }}
@@ -105,24 +112,33 @@ export function RiskScatter({ stats }: { stats: RiskStats }) {
             unit="%"
             domain={padded}
             tickFormatter={(value: number) => value.toFixed(0)}
-            width={38}
+            width={46}
             tick={{ fill: AXIS_TEXT, fontSize: AXIS_FONT }}
             stroke={GRID}
+            label={{
+              value: "Expected return (%)",
+              angle: -90,
+              position: "insideLeft",
+              offset: 14,
+              style: { textAnchor: "middle" },
+              fill: AXIS_TEXT,
+              fontSize: AXIS_FONT,
+            }}
           />
           {/* Area, not radius: perceived size scales with area, and the floor keeps the
               smallest holding above the 8px minimum so it stays hoverable. */}
           <ZAxis type="number" dataKey="z" range={[90, 520]} />
           {/* The ticker has to come from the payload: a scatter point's "label" is its x
               value, so the default tooltip header would read "72" and leave the reader with
-              no idea which holding they are hovering - the one thing labels cannot be relied
-              on for when two dots sit on top of each other. */}
+              no idea which holding they are hovering. */}
           <Tooltip
             {...TOOLTIP_STYLE}
             cursor={{ strokeDasharray: "3 3", stroke: GRID }}
             formatter={percentTooltip}
-            labelFormatter={(_label, payload) =>
-              (payload?.[0]?.payload as Point | undefined)?.ticker ?? ""
-            }
+            labelFormatter={(_label, payload) => {
+              const ticker = (payload?.[0]?.payload as Point | undefined)?.ticker ?? "";
+              return ticker.startsWith("frontier-") ? "Efficient frontier" : ticker;
+            }}
           />
           <Legend
             verticalAlign="top"
@@ -130,6 +146,23 @@ export function RiskScatter({ stats }: { stats: RiskStats }) {
             iconSize={8}
             wrapperStyle={{ fontSize: 10, color: AXIS_TEXT }}
           />
+
+          {/* Drawn FIRST so the markers sit on top of it. `line` connects the points and
+              the empty shape suppresses the 40 dots that would otherwise read as a series
+              of their own. */}
+          {frontier.length > 1 && (
+            <Scatter
+              name="Efficient frontier"
+              data={frontier}
+              fill={FRONTIER}
+              line={{ stroke: FRONTIER, strokeWidth: 2 }}
+              lineJointType="monotoneX"
+              shape={() => <g />}
+              legendType="line"
+              isAnimationActive={false}
+            />
+          )}
+
           <Scatter
             name="Holding"
             data={holdings}
@@ -148,7 +181,7 @@ export function RiskScatter({ stats }: { stats: RiskStats }) {
             />
           </Scatter>
           <Scatter
-            name="Portfolio"
+            name="Your portfolio"
             data={portfolio}
             fill={SERIES_MODEL}
             stroke={SURFACE}

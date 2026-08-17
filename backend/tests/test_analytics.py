@@ -7,6 +7,7 @@ an analytic one tells you the maths is wrong.
 from __future__ import annotations
 
 import math
+import random
 
 import pytest
 
@@ -307,3 +308,120 @@ def test_a_partial_sell_is_still_truncated() -> None:
     )
     sell = next(leg for leg in trades if leg["side"] == "sell")
     assert sell["ticker"] == "MU" and sell["quantity"] == 40.0
+
+
+# ---- efficient frontier ------------------------------------------------------
+
+FRONTIER_TICKERS = ["ALAB", "AMAT", "AMD", "ANET", "INTC", "LRCX", "MRVL", "MU", "PLTR", "SLV"]
+
+
+def build_frontier(tickers: list[str] = FRONTIER_TICKERS, points: int = 24):
+    cov = estimates.covariance(tickers)
+    mu = estimates.drifts(tickers)
+    return optimize.frontier(mu, cov, cap=1.0, points=points), cov, mu
+
+
+def test_frontier_is_monotone_in_both_axes() -> None:
+    """More risk buys more return, all the way along. A frontier that dips somewhere is not
+    a frontier - the dipping part is dominated by a point to its left."""
+    curve, _, _ = build_frontier()
+    assert len(curve) >= 8
+    for (v1, r1), (v2, r2) in zip(curve, curve[1:]):
+        assert v2 > v1
+        assert r2 > r1
+
+
+def test_frontier_starts_at_minimum_variance() -> None:
+    curve, cov, _ = build_frontier()
+    floor = risk.portfolio_volatility(cov, optimize.min_variance(cov, cap=1.0))
+    assert curve[0][0] == pytest.approx(floor, abs=5e-3)
+
+
+def test_frontier_ends_at_the_highest_drift_asset() -> None:
+    """Long-only, so the most return achievable is 100% of whatever has the largest mu."""
+    curve, _, mu = build_frontier()
+    assert curve[-1][1] == pytest.approx(max(mu), abs=1e-3)
+
+
+def test_no_portfolio_beats_the_frontier() -> None:
+    """The defining property, checked against 200 random long-only books: none of them may
+    sit above and to the left of the curve. If one does, the curve is not the frontier."""
+    curve, cov, mu = build_frontier()
+    rng = random.Random(7)
+
+    for _ in range(200):
+        raw = [rng.random() for _ in FRONTIER_TICKERS]
+        total = sum(raw)
+        weights = [value / total for value in raw]
+        volatility = risk.portfolio_volatility(cov, weights)
+        expected = sum(w * m for w, m in zip(weights, mu))
+
+        gap = optimize.frontier_gap(volatility, expected, curve)
+        # Tolerances absorb the linear interpolation between frontier points, which cuts a
+        # chord under a convex curve and so slightly understates it.
+        assert gap["volatility_at_same_return"] <= volatility + 5e-3
+        assert gap["return_at_same_volatility"] >= expected - 5e-3
+
+
+def test_a_frontier_portfolio_reports_almost_no_gap() -> None:
+    curve, cov, mu = build_frontier()
+    weights = optimize.min_variance(cov, cap=1.0)
+    gap = optimize.frontier_gap(
+        risk.portfolio_volatility(cov, weights),
+        sum(w * m for w, m in zip(weights, mu)),
+        curve,
+    )
+    assert gap["avoidable_volatility"] < 5e-3
+    assert gap["forgone_return"] < 5e-3
+
+
+def test_equal_weight_sits_inside_the_frontier() -> None:
+    """The whole point of showing the curve: a sensible-looking book is still not optimal."""
+    curve, cov, mu = build_frontier()
+    n = len(FRONTIER_TICKERS)
+    weights = [1 / n] * n
+    gap = optimize.frontier_gap(
+        risk.portfolio_volatility(cov, weights),
+        sum(w * m for w, m in zip(weights, mu)),
+        curve,
+    )
+    assert gap["avoidable_volatility"] > 0.0
+    assert gap["forgone_return"] > 0.0
+
+
+def test_gap_is_never_negative() -> None:
+    """A portfolio cannot beat the frontier, so a negative gap is interpolation noise -
+    and "-0.2% of avoidable risk" on screen reads as a bug."""
+    curve, cov, mu = build_frontier()
+    weights = optimize.min_variance(cov, cap=1.0)
+    gap = optimize.frontier_gap(
+        risk.portfolio_volatility(cov, weights),
+        sum(w * m for w, m in zip(weights, mu)),
+        curve,
+    )
+    assert gap["avoidable_volatility"] >= 0.0
+    assert gap["forgone_return"] >= 0.0
+
+
+def test_frontier_needs_at_least_two_assets() -> None:
+    cov = estimates.covariance(["MU"])
+    assert optimize.frontier(estimates.drifts(["MU"]), cov, points=8) == []
+    assert optimize.frontier_gap(0.5, 0.1, []) == {}
+
+
+def test_frontier_is_deterministic() -> None:
+    first, _, _ = build_frontier(points=16)
+    second, _, _ = build_frontier(points=16)
+    assert first == second
+
+
+@pytest.mark.asyncio
+async def test_frontier_is_cached_per_selection() -> None:
+    """Sigma and mu come from a data file, so the curve never changes for a ticker set -
+    and the panel re-requests it on every objective and cap change."""
+    risk._FRONTIER_CACHE.clear()
+    tickers = tuple(FRONTIER_TICKERS)
+    first = await risk.frontier_for(tickers, 1.0, 16)
+    second = await risk.frontier_for(tickers, 1.0, 16)
+    assert first is second                      # the cached tuple, not a recomputation
+    assert len(risk._FRONTIER_CACHE) == 1

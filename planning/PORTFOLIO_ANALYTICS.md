@@ -122,6 +122,48 @@ label the field `var_95_1d_parametric` rather than `var_95`, so nobody mistakes 
 
 **Correlation matrix** for display is `correlation_matrix(tickers)` directly — already normalised.
 
+### The efficient frontier
+
+Traced by sweeping risk aversion: for each λ, maximise `μᵀw − λ·wᵀΣw` over the capped simplex, λ
+log-spaced from 1e1.5 down to 1e-1.5. Large λ lands on minimum variance, small λ on the highest-drift
+asset, and everything between is on the frontier by construction. **No new optimisation maths** — it
+reuses the same projected-gradient solver the four objectives use.
+
+Two numbers come out of it, and they are what actually answer "how far from optimal am I?":
+
+| Field | Meaning |
+|---|---|
+| `avoidable_volatility` | risk you could shed **without giving up any expected return** |
+| `forgone_return` | return you could add **without taking any more risk** |
+
+Both are clamped at zero: a portfolio cannot beat the frontier, so a negative value is interpolation
+noise, and "−0.2% of avoidable risk" on screen reads as a bug.
+
+Measured against the risky sleeve renormalised to 1. Cash would drag every point toward the origin
+along a straight line, and a half-cash book compared against the raw curve reports as implausibly far
+inside something it was never on.
+
+**Performance, because this one bit.** The first cut took **2.4 seconds** in the container — a
+two-and-a-half second wait on the first click. Three things fixed it, in order of what they were worth:
+
+1. **Carry the backtracking step size between solves.** Each solve took a median of 4 iterations but
+   ~54 projections, because the first iteration rediscovered a usable step from 1.0 every time, ~30
+   halvings. Threading the hint through the sweep removed most of the work.
+2. **`PROJECTION_STEPS` 200 → 40.** The bracket is a few units wide, so 40 halvings put θ within 1e-12
+   — far tighter than weights rendered to two decimals need. This is the hot loop: every backtracking
+   candidate of every solve is projected, thousands of times per curve.
+3. **32 points, not 48.** The efficient-branch filter collapses duplicates anyway; 27 survive, which
+   is a smooth curve at the size it renders.
+
+Result: **179ms on the host, 336ms in the container, 6ms cached.**
+
+**`asyncio.to_thread` was the wrong tool and was removed.** The sweep is pure Python and holds the GIL
+throughout, so a worker thread relocates the stall without removing it — the E2E suite went from 47s to
+over four minutes, with specs that never touch analytics slowing down too. `frontier_for()` yields with
+`await asyncio.sleep(0)` between solves instead; each is ~12ms, invisible against a 500ms price tick.
+The result is cached forever per ticker set, because σ, μ and the correlations all come from a data
+file — prices tick, the frontier does not.
+
 Numerics: n ≤ ~30 tickers here, so **pure Python, no numpy**. The backend has no numeric dependency today
 (`fastapi`, `uvicorn`, `massive`, `tzdata`, `litellm`, `pydantic`) and adding one for a 30×30 matrix-vector
 product would be the largest dependency in the tree for the smallest reason. Every operation below is
@@ -384,6 +426,7 @@ Uses the seed scripts from `REBALANCE_TEST_HARNESS.md`:
 | 4 | `AnalyticsPanel` + charts + selection UI | **done**, verified in Chrome against a seeded book |
 | 5 | Playwright E2E | **done** — `test/tests/analytics.spec.ts`, 10 specs; whole suite 35 passing |
 | 6 *(optional)* | `estimator=realized` from Massive daily aggregates | not done; still optional |
+| 7 | **Efficient frontier** on the risk map, with the distance-to-frontier readout, and both axes labelled | **done** — 10 frontier tests + 2 E2E specs |
 
 ## 10b. What was built differently from this plan
 
