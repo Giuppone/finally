@@ -70,13 +70,27 @@ test.describe("portfolio analytics", () => {
     const rows = page.getByTestId("risk-report").locator("tbody tr");
     await expect(rows).toHaveCount(BASKET.length);
 
-    const parsed = await rows.evaluateAll((nodes) =>
-      nodes.map((node) => {
-        const cells = Array.from(node.querySelectorAll("td")).map((cell) =>
-          Number.parseFloat((cell.textContent ?? "").replace(/%/g, "")),
-        );
-        return { weight: cells[1], riskShare: cells[3] };
-      }),
+    // Columns are located by HEADER, not by index. Reading cells[3] positionally is how
+    // this spec broke when a CAGR column was inserted before Risk share - it silently
+    // started asserting on the wrong numbers rather than failing to find them.
+    const columns = await page
+      .getByTestId("risk-report")
+      .locator("thead th")
+      .allTextContents();
+    const weightAt = columns.findIndex((c) => c.trim() === "Weight");
+    const riskAt = columns.findIndex((c) => c.trim() === "Risk share");
+    expect(weightAt, "Weight column").toBeGreaterThan(-1);
+    expect(riskAt, "Risk share column").toBeGreaterThan(-1);
+
+    const parsed = await rows.evaluateAll(
+      (nodes, [w, r]) =>
+        nodes.map((node) => {
+          const cells = Array.from(node.querySelectorAll("td")).map((cell) =>
+            Number.parseFloat((cell.textContent ?? "").replace(/%/g, "")),
+          );
+          return { weight: cells[w], riskShare: cells[r] };
+        }),
+      [weightAt, riskAt],
     );
 
     const flat = 100 / BASKET.length;
@@ -139,16 +153,59 @@ test.describe("portfolio analytics", () => {
     }
   });
 
-  test("expected return is never shown without its basis", async ({ page, request }) => {
+  test("expected return is never shown without its basis and window", async ({
+    page,
+    request,
+  }) => {
     // The drift is the simulator's damped value, not a forecast. An unlabelled number here
-    // would be the one genuinely misleading thing this panel could do.
+    // would be the one genuinely misleading thing this panel could do - and a measurement
+    // with no date on it is only slightly better.
     await seedPortfolio(request, equalWeights(BASKET));
     await page.goto("/");
     await waitForStream(page);
     await openAnalytics(page, "risk");
 
+    const report = page.getByTestId("risk-report");
     await expect(page.getByTestId("risk-expected-return")).toContainText("%");
-    await expect(page.getByTestId("risk-report")).toContainText("damped drift");
+    await expect(report).toContainText("damped to ~10% of realised");
+    // The calibration window, so a reader can see how old the model is.
+    await expect(report).toContainText(/Measured from daily bars over\s+\d{4}-\d{2}-\d{2}/);
+    await expect(report).toContainText(/\d+ trading days/);
+  });
+
+  test("the detail table shows measured CAGR beside the damped drift", async ({
+    page,
+    request,
+  }) => {
+    // The whole reason CAGR is displayed: it makes the damping auditable. On this basket
+    // the two differ by an order of magnitude, which is exactly what should be visible.
+    await seedPortfolio(request, equalWeights(BASKET));
+    await page.goto("/");
+    await waitForStream(page);
+    await openAnalytics(page, "risk");
+
+    const header = page.getByTestId("risk-report").locator("thead");
+    await expect(header).toContainText("CAGR");
+
+    const stats = await (
+      await request.post("/api/analytics/risk", { data: {} })
+    ).json();
+
+    // Every seeded ticker is calibrated, so every row carries a measured growth rate.
+    for (const position of stats.positions) {
+      expect(position.calibrated).toBe(true);
+      expect(position.cagr).not.toBeNull();
+    }
+    expect(stats.warnings).toEqual([]);
+
+    // CAGR is the undamped measurement; expected_return is ~10% of the log-drift it came
+    // from. They must not be the same number, or the damping silently stopped happening.
+    const mu = stats.positions.find((p: { ticker: string }) => p.ticker === "MU");
+    expect(mu.cagr).toBeGreaterThan(mu.expected_return * 2);
+    expect(mu.expected_return).toBeLessThanOrEqual(0.2);
+
+    expect(stats.calibration.trading_days).toBeGreaterThan(60);
+    expect(stats.calibration.start < stats.calibration.end).toBe(true);
   });
 
   test("min variance never increases volatility", async ({ page, request }) => {

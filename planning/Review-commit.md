@@ -2,55 +2,68 @@
 
 ## Findings
 
-### P1 — The analytics drawer reports a partially invested portfolio as fully invested
+### P1 — `load_list` resets the account before validating every requested ticker
 
-[`AnalyticsPanel.tsx`](../frontend/components/AnalyticsPanel.tsx) normalizes the selected
-position weights to 1 before calling `postRisk`. Since that request omits `cash_weight`,
-[`post_risk`](../backend/app/analytics/routes.py) derives it as `1 - sum(weights)`, which is
-zero. A book with $2,000 invested and $8,000 cash is therefore displayed as a fully invested
-two-stock book, materially overstating volatility and VaR and misreporting expected return and
-Sharpe. Keep weights as fractions of total portfolio value and send residual cash, or use the
-live-portfolio API path for the initial selection. Add a cash-heavy UI/API regression test.
+[`cmd_build`](../backend/scripts/portfolio_tool.py#L617) calls
+`/api/portfolio/reset` before it adds the list's unwatched tickers at
+[lines 625–632](../backend/scripts/portfolio_tool.py#L625). A typo or symbol the market-data
+provider cannot anchor therefore fails only after the reset, leaving the user with an empty
+portfolio. This conflicts with the command's documented promise that a failed build will not
+leave a partially constructed portfolio. Preflight every ticker and price before reset, or save
+and restore the prior session if preparation fails. Add a regression test containing one valid
+and one invalid ticker.
 
-### P1 — Session import accepts non-finite floats and persists a corrupted account
+### P1 — Broker conversion can silently import an incomplete account
 
-[`SessionDocument`](../backend/app/routes.py) and [`SessionPosition`](../backend/app/routes.py)
-use range constraints but do not reject `Infinity`. Pydantic accepts positive infinity for
-`cash_balance`, `quantity`, and `avg_cost`; [`import_session`](../backend/app/db.py) then writes
-those values to SQLite. Subsequent valuation/snapshot responses contain non-finite values and may
-fail serialization, while the invalid state remains in the database. Explicitly require finite
-numbers before acquiring the trade lock, and cover each numeric field with route tests.
+[`parse_broker`](../backend/scripts/portfolio_tool.py#L398) scans the whole export with
+`finditer`. If a row stops matching the strict five-line expression—for example after a broker
+layout change—`finditer` skips it and resumes at the next matching ticker. The converter then
+normalizes the remaining rows and reports success; the arithmetic warning only covers rows that
+matched but did not reconcile. Require complete consumption of the holdings section, or reject
+and report unmatched non-whitespace text, rather than generating a partial allocation.
 
-### P1 — Session exports can combine values from different portfolio states
+### P2 — An all-local broker export crashes with an unhandled division by zero
 
-[`get_session`](../backend/app/routes.py) executes several autocommit reads (`value_portfolio`,
-`cash_balance`, `positions`, and `watchlist`) without a read transaction or `trade_lock`. In WAL
-mode each statement can observe a separate snapshot, so a trade committed between reads can yield,
-for example, pre-trade cash and post-trade positions. Restoring that document no longer restores an
-account state and can create or destroy value. Read the entire export in one SQLite read transaction
-or serialize export with the trade lock.
+After filtering non-CEDEAR rows, [`cmd_broker`](../backend/scripts/portfolio_tool.py#L555) does
+not check that `keep` is non-empty. `kept_total` is then zero and the list comprehension at
+[line 562](../backend/scripts/portfolio_tool.py#L562) raises `ZeroDivisionError`, bypassing the
+CLI's `ApiError` handling. Fail with a clear message before calculating weights; `--keep-local`
+should only be suggested if those tickers can be traded in the target market.
 
-### P2 — Rebalance charts compare weights on different bases
+### P2 — Exactly-zero measured correlations are discarded as though absent
 
-[`build_plan`](../backend/app/analytics/rebalance.py) emits `current_weight` as a share of total
-portfolio value, including cash, but emits `target_weight` as a share of the invested sleeve.
-[`RebalancePreview`](../frontend/components/RebalancePreview.tsx) renders them as “Current vs target
-weight.” With the default retained-cash behavior, an already correctly allocated 20%-invested book
-looks like 20% current bars versus 100% target bars. Use one denominator for both values (usually the
-invested sleeve), or label and scale targets as total-portfolio weights.
+[`sector_rho`](../backend/app/market/simulator.py#L166) uses `measured_a or measured_b` to select
+a calibrated correlation. A valid `0.0`/`-0.0` is falsy, so the code falls back to the sector or
+default value instead. The generated data already contains `("AMD", "LMT"): -0.00` and
+`("MSFT", "SNDK"): -0.00`; both are currently treated as the default `0.35`, materially changing
+the covariance matrix. Check dictionary membership (or use an explicit `is not None` lookup) and
+add a zero-correlation test.
 
-### P2 — Explicit rebalance weights are silently ignored
+### P2 — A malformed cache timestamp can crash recalibration instead of being refreshed
 
-The advertised `holdings` shape for [`POST /api/analytics/rebalance`](PORTFOLIO_ANALYTICS.md)
-includes optional weights, documented as omittable to mean “current.” However,
-[`post_rebalance`](../backend/app/analytics/routes.py) discards the weights returned by `_weights`
-and builds the before-state/current values solely from the live account. An API caller supplying a
-90/10 allocation thus receives a plan for a different, live allocation without warning. Either make
-`holdings` a ticker-only universe selector, or use supplied weights consistently when calculating
-the preview and plan.
+[`is_fresh`](../backend/scripts/calibrate_market.py#L212) subtracts an aware UTC time from
+`datetime.fromisoformat(fetched)` but catches only `ValueError`. A cache entry with an otherwise
+valid but timezone-naive timestamp raises `TypeError` and aborts the command. Treat both malformed
+and timezone-naive timestamps as stale (or normalize naive timestamps) and cover that cache
+input in the existing test suite.
+
+### P2 — A real brokerage account export is present as repository content
+
+[`suggested/sugested.txt`](../suggested/sugested.txt) includes individual positions and ARS market
+values from a real account. It is untracked today, but nothing prevents it from being committed or
+distributed with the project. Remove/redact it in favor of a synthetic fixture and add a scoped
+ignore rule for local broker exports if this data is not intended to be public.
+
+### P3 — The new quick-start path contains a backspace control character
+
+[`CLAUDE.md`](../CLAUDE.md#L67) renders the broker output as `suggested` followed by a backspace
+character and `roker.txt`, rather than the intended `suggested\\broker.txt`. Replace the control
+character with a literal backslash so the documented path can be copied correctly.
 
 ## Verification
 
-- `cd backend && .\\.venv\\Scripts\\python.exe -m pytest -q` — 299 passed.
-- Confirmed directly that `SessionDocument` currently accepts `Infinity` for `cash_balance`,
-  position `quantity`, and `avg_cost`.
+- `cd backend && uv run pytest -q` — **373 passed**.
+- `cd backend && uv run pytest -q tests/test_portfolio_tool.py tests/test_calibrate.py tests/test_simulator.py` — **95 passed**.
+- `git diff --check` — no whitespace errors.
+- Directly reproduced the naive-timestamp `TypeError` in `is_fresh`; inspected the generated
+  `-0.00` correlation entries and the reset-before-watchlist-add execution order.

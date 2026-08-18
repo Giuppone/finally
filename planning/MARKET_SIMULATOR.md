@@ -16,6 +16,31 @@ the three modes in [MARKET_INTERFACE.md](MARKET_INTERFACE.md):
 Every parameter below was calibrated against real market data pulled from Massive on 2026-08-10
 (172 daily bars, 2025-12-01 → 2026-08-07). Reproduce with the script in §9.
 
+> **Recalibrated 2026-08-17** over 2025-12-07 → 2026-08-14 (172 bars) across **26 tickers** — the
+> seed ten plus sixteen imported from a real brokerage account. `scripts/calibrate_market.py` now
+> exists and does this; §9 specified it long before it was written. The tables in §2 and §4 below
+> are the *original* pull and are kept as the derivation; `seeds.py` is the live source of truth.
+>
+> Two findings from that run, both worth carrying into how the numbers are read:
+>
+> - **Volatility is stable; drift is not.** Shifting the window by one week moved every σ by under
+>   2% (MU 0.885 → 0.883, SLV 0.749 → 0.749, AMAT 0.644 → 0.650) while ALAB's realised μ nearly
+>   halved, 1.600 → 0.891. That instability *is* §6's argument for damping, measured rather than
+>   asserted — and it is why the risk panel presents σ and correlation as measurements but μ as an
+>   assumption.
+> - **Some drifts are now negative** (META, MELI, NU, MP, PLTR). Only the upside is capped, so a
+>   name that fell over the window drifts down in the simulator too — the two-sided market §6 was
+>   trying to buy.
+>
+> Measured pairwise correlations (`MEASURED_RHO`) now take precedence over the §4 sector blocks,
+> which remain the fallback for any pair involving an uncalibrated ticker. The blocks were blindest
+> exactly where it mattered: SMH is a semiconductor ETF realising 0.85–0.90 against LRCX, AMAT and
+> ASML, and no sector rule gave it anything but the 0.35 default — telling the optimiser that a fund
+> holding the whole sector was an excellent hedge against that sector.
+>
+> Raw closes are cached in `backend/calibration/bars.json`, so adding a ticker costs one API call
+> rather than twenty-six — which matters on a 5 req/min key.
+
 ---
 
 ## 1. Model: jump-diffusion GBM
@@ -459,6 +484,11 @@ rather than an archaeology exercise:
 
 ```
 scripts/calibrate_market.py   ->   rewrites backend/app/market/seeds.py
+
+**Written 2026-08-17.** It does what this section asked, plus a bars cache
+(`backend/calibration/bars.json`) so adding one ticker costs one request rather than
+refetching the set - correlations need aligned series, so the raw closes have to be kept,
+not just the derived parameters. Both guards below are implemented.
 ```
 
 It should pull `list_aggs(timespan="day")` for each seed ticker over ~8 months, compute annualised σ

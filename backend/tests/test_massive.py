@@ -13,6 +13,7 @@ from app.market.massive import (
     RateLimiter,
     probe_entitlement,
 )
+from app.market.seeds import SEED_PRICES
 from app.market.source import Entitlement
 
 from .conftest import StubGateway, bar, snapshot
@@ -109,7 +110,7 @@ async def test_walkback_gives_up_after_seven_days() -> None:
     resolved = await provider.anchors(["MU"], "2026-08-12")
     grouped_calls = [c for c in gateway.calls if c[0] == "get_grouped_daily_aggs"]
     assert len(grouped_calls) == 7             # GROUPED_LOOKBACK_DAYS, then it stops
-    assert resolved == {"MU": 877.57}          # fell through to the seed table, not empty
+    assert resolved == {"MU": SEED_PRICES["MU"]}   # fell through to the seed table
 
 
 @pytest.mark.asyncio
@@ -142,7 +143,7 @@ async def test_an_unreachable_provider_degrades_to_the_seed_table() -> None:
     })
     provider = MassiveAnchorProvider(gateway)
     resolved = await provider.anchors(["MU", "ZZZZ"], "2026-08-12")
-    assert resolved == {"MU": 877.57}                        # startup still succeeds
+    assert resolved == {"MU": SEED_PRICES["MU"]}             # startup still succeeds
 
 
 # ---- live source -------------------------------------------------------

@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 import pytest
 
 from app.market import MarketDataService, Mode, PriceCache, Tick
+from app.market.seeds import SEED_PRICES
 from app.market.service import current_session_date
 from app.market.simulator import GBMEngine, SimulatedSource, StaticAnchorProvider
 
@@ -41,7 +42,7 @@ async def test_start_seeds_every_tracked_ticker(static_anchors) -> None:
     await service.start({"MU", "AMD"})
     try:
         assert service.tracked == {"MU", "AMD"}
-        assert cache.get("MU").open_price == 877.57       # priced from the first frame
+        assert cache.get("MU").open_price == SEED_PRICES["MU"]   # priced from the first frame
         assert cache.get("MU").session_date == service.session_date
     finally:
         await service.stop()
@@ -78,7 +79,7 @@ async def test_sync_tracked_adds_and_prices_new_tickers(static_anchors) -> None:
     try:
         await service.sync_tracked({"MU", "SLV"})
         assert service.tracked == {"MU", "SLV"}
-        assert cache.get("SLV").open_price == 57.50
+        assert cache.get("SLV").open_price == SEED_PRICES["SLV"]
     finally:
         await service.stop()
 
@@ -91,7 +92,7 @@ async def test_add_ticker_returns_a_priced_quote(static_anchors) -> None:
     quote = await service.add_ticker("PLTR")
     assert quote is not None
     assert quote.price > 0
-    assert quote.open_price == 172.01
+    assert quote.open_price == SEED_PRICES["PLTR"]
     assert "PLTR" in service.tracked
 
 

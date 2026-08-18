@@ -3,7 +3,7 @@
 import { RiskScatter } from "@/components/RiskScatter";
 import { WeightBars, type WeightRow } from "@/components/WeightBars";
 import { SERIES_ACTUAL, SERIES_MODEL } from "@/lib/chart";
-import { DASH, money } from "@/lib/format";
+import { DASH, money, toneClass } from "@/lib/format";
 import type { RiskStats } from "@/lib/types";
 
 export function Stat({
@@ -33,6 +33,21 @@ export function Stat({
 
 const pct = (value: number | null | undefined, digits = 1) =>
   value == null || !Number.isFinite(value) ? DASH : `${(value * 100).toFixed(digits)}%`;
+
+/**
+ * Signed percent that survives a growth rate of +639%.
+ *
+ * CAGR on this basket runs into the hundreds — MU measured 6.39 over the window — so the
+ * usual one-decimal format would print "+639.0%" and blow the column open. Anything past
+ * 100% drops its decimal; the sign is always shown, because a name that fell is the useful
+ * thing to spot at a glance.
+ */
+const growth = (value: number | null | undefined) => {
+  if (value == null || !Number.isFinite(value)) return DASH;
+  const scaled = value * 100;
+  const digits = Math.abs(scaled) >= 100 ? 0 : 1;
+  return `${scaled >= 0 ? "+" : ""}${scaled.toFixed(digits)}%`;
+};
 
 export function RiskReport({ stats }: { stats: RiskStats }) {
   const rows: WeightRow[] = stats.positions
@@ -101,9 +116,15 @@ export function RiskReport({ stats }: { stats: RiskStats }) {
 
       {/* The expected return above is the simulator's damped drift. Never show it bare. */}
       <p className="border-l-2 border-accent/70 bg-accent/5 px-2 py-1 text-2xs text-muted">
-        Expected return basis: {stats.expected_return_basis}. Volatility and correlation are
-        the calibrated parameters the price engine itself uses; the drift is damped, so read
-        it as the model&apos;s assumption, not a forecast.
+        Measured from daily bars over{" "}
+        <span className="tnum text-ink">
+          {stats.calibration.start} &rarr; {stats.calibration.end}
+        </span>{" "}
+        ({stats.calibration.trading_days} trading days, pulled {stats.calibration.pulled}).
+        Volatility and correlation are the parameters the price engine itself uses. The
+        drift is <span className="text-ink">damped to ~10% of realised, capped at 20%</span>,
+        so read Expected return as the model&apos;s assumption — the CAGR column below is
+        the growth actually measured.
       </p>
 
       {stats.warnings.length > 0 && (
@@ -172,6 +193,9 @@ export function RiskReport({ stats }: { stats: RiskStats }) {
               <th className="py-1 pr-2 text-left font-medium">Ticker</th>
               <th className="px-2 text-right font-medium">Weight</th>
               <th className="px-2 text-right font-medium">Vol</th>
+              <th className="px-2 text-right font-medium" title="Measured growth over the calibration window; not a forecast">
+                CAGR
+              </th>
               <th className="px-2 text-right font-medium">Risk share</th>
               <th className="pl-2 text-right font-medium">Marginal</th>
             </tr>
@@ -190,6 +214,11 @@ export function RiskReport({ stats }: { stats: RiskStats }) {
                 <td className="tnum px-2 text-right text-muted">{pct(position.weight)}</td>
                 <td className="tnum px-2 text-right text-muted">
                   {pct(position.volatility, 0)}
+                </td>
+                {/* Measured, so it carries a direction — unlike the damped drift beside it,
+                    which is an assumption and deliberately not colour-coded. */}
+                <td className={`tnum px-2 text-right ${toneClass(position.cagr)}`}>
+                  {growth(position.cagr)}
                 </td>
                 <td className="tnum px-2 text-right">{pct(position.risk_share)}</td>
                 <td className="tnum pl-2 text-right text-muted">

@@ -8,6 +8,7 @@ import math
 import pytest
 
 from app.market.massive import MassiveLiveSource
+from app.market.seeds import SEED_PRICES
 from app.market.simulator import GBMEngine, SimulatedSource, StaticAnchorProvider
 
 from .conftest import StubGateway, snapshot
@@ -83,7 +84,7 @@ async def test_simulated_source_rebase_moves_the_path() -> None:
 async def test_static_anchor_provider() -> None:
     provider = StaticAnchorProvider()
     resolved = await provider.anchors(["MU", "ZZZZ"], "2026-08-12")
-    assert resolved["MU"] == 877.57                       # the seed table
+    assert resolved["MU"] == SEED_PRICES["MU"]            # the seed table
     assert 40.0 <= resolved["ZZZZ"] <= 400.0              # plausible fallback level
     assert await provider.is_known("ANYTHING") is True    # regex is the only gate
     await provider.refresh("2026-08-13")

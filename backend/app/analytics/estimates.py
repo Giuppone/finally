@@ -20,7 +20,12 @@ the true drift of the simulated process but NOT a forecast of the real stock
 
 from __future__ import annotations
 
-from ..market.seeds import DEFAULT_PARAMS, TICKER_PARAMS
+from ..market.seeds import (
+    CALIBRATION_WINDOW,
+    DEFAULT_PARAMS,
+    TICKER_CAGR,
+    TICKER_PARAMS,
+)
 from ..market.simulator import correlation_matrix
 
 # Annual, decimal. The Sharpe denominator and the return on the cash sleeve. Reported in
@@ -59,6 +64,23 @@ def covariance(tickers: list[str]) -> list[list[float]]:
         [rho[i][j] * sigma[i] * sigma[j] for j in range(len(tickers))]
         for i in range(len(tickers))
     ]
+
+
+def cagr(ticker: str) -> float | None:
+    """Realised compound annual growth over the calibration window, or None if never
+    measured. DISPLAY ONLY - it is shown beside the damped drift so the damping is
+    auditable, and it must never reach the simulator or the optimisers.
+
+    The two differ by more than people expect: MU's damped drift is 0.20 against a measured
+    CAGR of 6.39, because CAGR = exp(log-drift) - 1 and this window covers a melt-up.
+    """
+    return TICKER_CAGR.get(ticker)
+
+
+def window() -> dict:
+    """The window every sigma, mu and correlation was measured over. Surfaced in the risk
+    panel so a reader can judge how old the model is without reading the source."""
+    return dict(CALIBRATION_WINDOW)
 
 
 def is_known(ticker: str) -> bool:

@@ -12,6 +12,7 @@ from .seeds import (
     DEFAULT_PARAMS,
     DEFAULT_RHO,
     FALLBACK_PRICE_RANGE,
+    MEASURED_RHO,
     SECTOR_RHO,
     SECTORS,
     SEED_PRICES,
@@ -163,6 +164,23 @@ def correlation_matrix(tickers: list[str]) -> list[list[float]]:
 
 
 def sector_rho(a: str, b: str) -> float:
+    """Correlation between two tickers: measured first, then sector blocks, then the default.
+
+    The measured pairs come from `calibrate_market.py` and cover every pair of calibrated
+    tickers. They matter most where the sector blocks are blindest: SMH is a semiconductor
+    ETF that realises 0.85-0.90 against LRCX, AMAT and ASML, and no sector table assigned it
+    anything but the 0.35 default - which told the optimiser that a fund holding the whole
+    sector was an excellent hedge against the sector.
+
+    The blocks remain the fallback, and that is what still lets the model price a ticker the
+    user adds tomorrow, before anyone has calibrated it.
+    """
+    if a == b:
+        return 1.0
+    measured = MEASURED_RHO.get((a, b)) or MEASURED_RHO.get((b, a))
+    if measured is not None:
+        return measured
+
     sa, sb = SECTORS.get(a, "other"), SECTORS.get(b, "other")
     if sa == sb:
         return SECTOR_RHO.get((sa, sa), DEFAULT_RHO)

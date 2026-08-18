@@ -8,12 +8,13 @@ import statistics
 import pytest
 
 from app.market import simulator
-from app.market.seeds import SEED_WATCHLIST
+from app.market.seeds import MEASURED_RHO, SEED_WATCHLIST, TICKER_PARAMS
 from app.market.simulator import (
     JUMP_MAX,
     SECONDS_PER_TRADING_YEAR,
     GBMEngine,
     _cholesky,
+    _factor,
     correlation_matrix,
     diffusion_sigma,
     sector_rho,
@@ -109,27 +110,57 @@ def test_correlation_recovers_a_near_independent_pair(monkeypatch: pytest.Monkey
     assert _measure_rho(monkeypatch, "AMD", "PLTR") == pytest.approx(0.15, abs=0.05)
 
 
-def test_sector_rho_lookup() -> None:
-    assert sector_rho("LRCX", "AMAT") == 0.90        # same block
-    assert sector_rho("MU", "LRCX") == 0.65          # cross block, either order
-    assert sector_rho("LRCX", "MU") == 0.65
-    assert sector_rho("PLTR", "MU") == 0.15          # wildcard
-    assert sector_rho("SLV", "AMAT") == 0.25
-    assert sector_rho("ZZZZ", "MU") == 0.35          # unknown -> DEFAULT_RHO
+def test_measured_correlations_win_over_the_blocks() -> None:
+    """A calibrated pair uses its measured value, in either order. The blocks were always a
+    stand-in for a measurement; where one exists it should be used."""
+    measured = MEASURED_RHO[("AMAT", "LRCX")]
+    assert sector_rho("AMAT", "LRCX") == measured
+    assert sector_rho("LRCX", "AMAT") == measured
+    assert measured != 0.90                          # not the semicap block value
+
+
+def test_a_ticker_correlates_perfectly_with_itself() -> None:
+    assert sector_rho("MU", "MU") == 1.0
+
+
+def test_the_blocks_still_cover_an_uncalibrated_ticker() -> None:
+    """This is what lets the model price a name the user adds before anyone calibrates it -
+    the reason MARKET_SIMULATOR.md §4 encodes blocks rather than a frozen matrix."""
+    assert sector_rho("PLTR", "COIN") == 0.15        # software wildcard
+    assert sector_rho("SLV", "COIN") == 0.25         # commodity wildcard
+    assert sector_rho("LRCX", "COIN") == 0.35        # no rule -> DEFAULT_RHO
     assert sector_rho("ZZZZ", "YYYY") == 0.35        # both unknown, same "other" sector
 
 
 def test_correlation_matrix_is_positive_definite_without_the_ridge() -> None:
-    # This is the test that catches a bad SECTOR_RHO edit — in CI, not in the demo.
+    """Catches a bad SECTOR_RHO or MEASURED_RHO edit in CI rather than in the demo.
+
+    Every case is a set of DISTINCT tickers, which is the only kind the tracked set can
+    ever hold. The whole calibrated universe is included: a measured matrix has no reason
+    to be positive definite a priori, and a recalibration that produced one that is not
+    would otherwise only surface as a silent fall through to the ridge.
+    """
     cases = [
         list(SEED_WATCHLIST),
-        ["LRCX", "AMAT"] * 12,
-        [f"X{i}" for i in range(50)],
+        sorted(TICKER_PARAMS),                       # every calibrated ticker
+        [f"X{i}" for i in range(50)],                # all unknown -> flat DEFAULT_RHO
         ["MU", "AMD", "INTC", "MRVL", "ALAB"],
         ["LRCX", "AMAT"],
+        ["LRCX", "AMAT", "SMH", "ASML"],             # the 0.85-0.91 cluster
     ]
     for tickers in cases:
-        assert _cholesky(correlation_matrix(tickers)) is not None
+        assert _cholesky(correlation_matrix(tickers)) is not None, tickers
+
+
+def test_repeated_tickers_fall_back_to_the_ridge() -> None:
+    """A ticker listed twice is perfectly correlated with itself, so the raw matrix is
+    singular by construction - correct maths, not a bad edit. `_factor` must still return
+    a usable factor, because a crash in the price loop is the one outcome that is not
+    survivable.
+    """
+    duplicated = ["LRCX", "AMAT"] * 12
+    assert _cholesky(correlation_matrix(duplicated)) is None      # genuinely singular
+    assert _factor(duplicated) is not None                        # ridge rescues it
 
 
 def test_seeded_runs_are_bit_reproducible() -> None:

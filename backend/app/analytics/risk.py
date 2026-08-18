@@ -112,6 +112,8 @@ def portfolio_stats(
             "risk_contribution": round(contributions[i], 6),
             "risk_share": round(contributions[i] / vol, 6) if vol > 0 else 0.0,
             "calibrated": estimates.is_known(ticker),
+            # Measured growth, beside the damped assumption. None when uncalibrated.
+            "cagr": estimates.cagr(ticker),
         }
         for i, ticker in enumerate(tickers)
     ]
@@ -140,6 +142,7 @@ def portfolio_stats(
         "cash_weight": round(cash_weight, 6),
         "risk_free_rate": rf,
         "expected_return_basis": estimates.EXPECTED_RETURN_BASIS,
+        "calibration": estimates.window(),
         "positions": positions,
         "correlations": {
             "tickers": list(tickers),

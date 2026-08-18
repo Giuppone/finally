@@ -62,7 +62,7 @@ run_portfolio_tool() {
     # exec because they only talk HTTP; save and load are not, so say so rather than
     # writing a file that vanishes with the container.
     case "$1" in
-      save|load)
+      save|load|dump|build|broker)
         echo "save/load need Python on the host: they read and write files under" >&2
         echo "sessions/, and the container's filesystem is not the host's." >&2
         echo "Install Python 3.9+ (or run the tool yourself with an explicit --file" >&2

@@ -179,3 +179,154 @@ def test_a_real_run_does_reset(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_no_reset_skips_the_reset(monkeypatch: pytest.MonkeyPatch) -> None:
     api = run_cli(monkeypatch, ["equal", "--yes", "--no-reset"])
     assert ("POST", "/api/portfolio/reset") not in api.calls
+
+
+# ---- holdings lists ----------------------------------------------------------
+
+def test_list_accepts_every_reasonable_separator() -> None:
+    """This file is meant to be typed by a human. A format that rejects the obvious
+    spellings is a format people stop using."""
+    holdings, _, warnings = portfolio_tool.parse_list(
+        "MU 10\nAMD:  5\nSLV, 40\nPLTR = 2.5\n"
+    )
+    assert holdings == [("MU", 10.0), ("AMD", 5.0), ("SLV", 40.0), ("PLTR", 2.5)]
+    assert warnings == []
+
+
+def test_list_ignores_comments_and_blank_lines() -> None:
+    holdings, _, warnings = portfolio_tool.parse_list(
+        "# a header\n\n  \nMU 10   # a trailing note\n"
+    )
+    assert holdings == [("MU", 10.0)]
+    assert warnings == []
+
+
+def test_list_lowercase_tickers_are_normalised() -> None:
+    holdings, _, _ = portfolio_tool.parse_list("mu 10\n")
+    assert holdings == [("MU", 10.0)]
+
+
+@pytest.mark.parametrize("line, fragment", [
+    ("BADROW", "expected 'TICKER QTY'"),
+    ("MU lots", "not a number"),
+    ("MU -3", "not positive"),
+    ("MU 0", "not positive"),
+])
+def test_a_bad_row_is_reported_and_skipped(line: str, fragment: str) -> None:
+    """One fat-fingered row must not throw away the other nine."""
+    holdings, _, warnings = portfolio_tool.parse_list(f"AMD 5\n{line}\nSLV 2\n")
+    assert [h[0] for h in holdings] == ["AMD", "SLV"]
+    assert any(fragment in warning for warning in warnings)
+
+
+def test_a_repeated_ticker_is_skipped_not_merged() -> None:
+    """Two rows for one ticker have no single correct reading - summing them would invent a
+    position the user did not write."""
+    holdings, _, warnings = portfolio_tool.parse_list("MU 10\nMU 5\n")
+    assert holdings == [("MU", 10.0)]
+    assert any("twice" in warning for warning in warnings)
+
+
+def test_an_empty_list_yields_nothing() -> None:
+    assert portfolio_tool.parse_list("# only comments\n\n") == ([], "shares", [])
+
+
+def test_dump_round_trips_through_the_parser() -> None:
+    """What `dump` writes, `build` must be able to read - including the header."""
+    original = [("ALAB", 2.989), ("MU", 0.982), ("SLV", 16.3215)]
+    holdings, mode, warnings = portfolio_tool.parse_list(
+        portfolio_tool.format_list(original, ["# a header"])
+    )
+    assert mode == "shares"
+    assert holdings == original
+    assert warnings == []
+
+
+# ---- weights in a list -------------------------------------------------------
+
+def test_a_percent_row_is_a_weight() -> None:
+    holdings, mode, warnings = portfolio_tool.parse_list("MU 40%\nAMD 60%\n")
+    assert mode == "weight"
+    assert holdings == [("MU", 0.4), ("AMD", 0.6)]
+    assert warnings == []
+
+
+def test_mixing_shares_and_weights_is_refused() -> None:
+    """"4 shares of MU and 30% of AMD" has no combined reading, so guessing one is worse
+    than saying so."""
+    with pytest.raises(ValueError, match="mixes"):
+        portfolio_tool.parse_list("MU 4\nAMD 30%\n")
+
+
+def test_weight_list_round_trips_through_the_formatter() -> None:
+    original = [("MU", 0.1008), ("ASML", 0.0954)]
+    holdings, mode, _ = portfolio_tool.parse_list(
+        portfolio_tool.format_list(original, ["# a header"], mode="weight")
+    )
+    assert mode == "weight"
+    for (ticker, weight), (original_ticker, original_weight) in zip(holdings, original):
+        assert ticker == original_ticker
+        assert weight == pytest.approx(original_weight, abs=1e-5)
+
+
+# ---- broker export -----------------------------------------------------------
+
+BROKER_SAMPLE = """MU
+CEDEAR MICRON TECHNOLOGY INC
+45$305.650 0,00%$221.905,56$3.773.000,00
+ 37,78%
+$13.754.250,00 AMZN
+CEDEAR AMAZON.COM, INC
+1.343$2.872,50 0,00%$2.295,96$777.645,00
+ 25,22%
+$3.857.767,50 TGNO4
+TRANS GAS DEL NORTE "C" ORD $
+437$3.345,00 0,00%$4.460,00-$485.070,00
+ -24,89%
+$1.461.765,00"""
+
+
+def test_argentine_numbers_are_read_the_argentine_way() -> None:
+    """'.' groups thousands and ',' is the decimal point. Reading '305.650' the American
+    way understates the holding by a factor of a thousand."""
+    assert portfolio_tool.parse_amount("305.650") == 305_650.0
+    assert portfolio_tool.parse_amount("221.905,56") == pytest.approx(221_905.56)
+    assert portfolio_tool.parse_amount("2.872,50") == pytest.approx(2_872.50)
+    assert portfolio_tool.parse_amount("45") == 45.0
+
+
+def test_broker_export_parses_every_field() -> None:
+    rows, warnings = portfolio_tool.parse_broker(BROKER_SAMPLE)
+    assert warnings == []
+    assert [row.ticker for row in rows] == ["MU", "AMZN", "TGNO4"]
+
+    mu = rows[0]
+    assert mu.quantity == 45
+    assert mu.price == pytest.approx(305_650.0)
+    assert mu.market_value == pytest.approx(13_754_250.0)
+    assert mu.is_cedear is True
+
+
+def test_a_locally_listed_row_is_marked() -> None:
+    """The 'CEDEAR' prefix is what says a row has a US underlying. TGNO4 does not, so it
+    cannot be mapped to a US ticker and the converter drops it."""
+    rows, _ = portfolio_tool.parse_broker(BROKER_SAMPLE)
+    assert rows[2].ticker == "TGNO4"
+    assert rows[2].is_cedear is False
+
+
+def test_a_row_whose_arithmetic_does_not_reconcile_is_rejected() -> None:
+    """quantity x price must equal the stated market value. That is a free correctness check
+    on an undocumented format, and it is what would catch a decimal-separator mistake -
+    which no looser check would, since the result parses perfectly well as a number."""
+    corrupted = BROKER_SAMPLE.replace("$13.754.250,00", "$99.999.999,00")
+    rows, warnings = portfolio_tool.parse_broker(corrupted)
+    assert [row.ticker for row in rows] == ["AMZN", "TGNO4"]
+    assert any("MU" in warning and "did not parse cleanly" in warning
+               for warning in warnings)
+
+
+def test_an_unrecognised_file_says_so_rather_than_returning_nothing() -> None:
+    rows, warnings = portfolio_tool.parse_broker("this is not a broker export\n")
+    assert rows == []
+    assert any("right file" in warning for warning in warnings)

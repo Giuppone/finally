@@ -17,8 +17,12 @@ state repeatable across restarts and shareable as a file.
 | `scripts/lib_portfolio_tool.sh` / `.ps1` | shared runner: finds a Python, falls back to `docker exec` |
 | `scripts/equal_weight_portfolio.sh` / `.ps1` | wrapper → `portfolio_tool.py equal` |
 | `scripts/start_random_portfolio.sh` / `.ps1` | wrapper → `portfolio_tool.py random` |
-| `scripts/save_session.sh` / `.ps1` | wrapper → `portfolio_tool.py save` |
-| `scripts/load_session.sh` / `.ps1` | wrapper → `portfolio_tool.py load` |
+| `scripts/save_session.sh` / `.ps1` | wrapper → `portfolio_tool.py save` (exact JSON) |
+| `scripts/load_session.sh` / `.ps1` | wrapper → `portfolio_tool.py load` (exact JSON) |
+| `scripts/import_broker.sh` / `.ps1` | wrapper → `portfolio_tool.py broker` (broker export → weights list) |
+| `scripts/save_list.sh` / `.ps1` | wrapper → `portfolio_tool.py dump` (editable list) |
+| `scripts/load_list.sh` / `.ps1` | wrapper → `portfolio_tool.py build` (editable list) |
+| `suggested/` | where holdings lists live |
 | `backend/app/routes.py` | `GET /api/session`, `POST /api/session` (§6) |
 | `backend/app/db.py` | `import_session()` — the transactional restore |
 | `backend/tests/test_portfolio_tool.py` | 16 tests: the pure allocation functions, plus the --dry-run write guard |
@@ -262,6 +266,82 @@ Decisions worth keeping:
 
 Hand-editing a session file is a supported workflow — it is the fastest way to author a specific
 portfolio for a test without trading into it.
+
+### Two save formats, on purpose
+
+| | `save_session` / `load_session` | `save_list` / `load_list` |
+|---|---|---|
+| Format | JSON, `sessions/NAME.json` | plain text, `suggested/NAME.txt` |
+| Contents | cash, quantities **and average costs** | ticker + quantity only |
+| Restores by | writing the rows directly (`POST /api/session`) | **resetting to $10,000 and buying at market** |
+| Faithful? | exact, to the cent | quantities yes, cost basis and cash no |
+| For | reproducing a book precisely — E2E fixtures, before/after comparisons | designing a book by hand |
+
+The list format exists because the session JSON is faithful and horrible to edit: nested
+objects, unrounded floats, an average cost per row. Nobody wants to hand-tune a column of
+quantities in that. A list is what you actually want to type:
+
+```
+MU     4          # a big semiconductor bet
+AMD:   6
+SLV,   40
+PLTR = 9
+```
+
+Space, comma, colon and equals all separate; `#` starts a comment; a row that cannot be read
+is **reported and skipped**, never fatal — one fat-fingered line should not throw away the
+other nine. A repeated ticker is skipped rather than summed, because two rows for one name
+have no single correct reading.
+
+`load_list` **buys at market** rather than writing quantities into the database, so the book
+is built exactly the way a person would build it — through validation, the trade blotter and
+the watchlist auto-add. That means it can run out of cash, so the cost is checked against the
+balance *before the first order*: a rejection halfway through leaves a half-built portfolio,
+which is precisely what a list is supposed to prevent. The error names the shortfall and the
+percentage to scale by.
+
+### Importing a real brokerage account
+
+`import_broker` reads an Argentine broker's holdings export and writes a weights list.
+
+**Weights, not share counts, and that is the whole design decision.** Those holdings are
+CEDEARs — certificates over a *fraction* of a US share, at a ratio that differs per stock,
+priced in pesos. 100 MU CEDEARs is not 100 MU shares, and a nine-figure-peso book is not a
+$10,000 one. The share counts in that file are meaningless here in every respect but one:
+the proportions they represent. So the proportions are what carries over, and `load_list`
+sizes them against whatever cash it has.
+
+Which is why the list format grew a second row shape:
+
+```
+MU     4          # 4 shares
+MU     10.08%     # 10.08% of the book
+```
+
+Mixing the two in one file raises rather than guesses — "4 shares of MU and 30% of AMD" has
+no combined reading.
+
+The export is an undocumented table flattened across five lines per holding, with the *next*
+record's ticker riding on the end of the market-value line. Every row is checked against its
+own arithmetic — `quantity × price` must equal the stated market value — and a row that fails
+is reported and skipped. That check is free and it is the one that would catch a
+decimal-separator mistake, which no looser check would: `305.650` parses perfectly well as
+either 305,650 or 305.65, and getting it wrong misstates the holding by a factor of a
+thousand. All 25 rows of the real file reconcile.
+
+Rows without a `CEDEAR` prefix are locally-listed instruments with no US ticker (TGNO4, in
+that file). They are dropped, named in the generated file's header, and the remaining weights
+are renormalised so the book is not left under-invested by the dropped weight. `--keep-local`
+overrides.
+
+The same renormalisation applies at load time to anything FinAlly cannot price, for the same
+reason: sizing against the original weights and dropping afterwards silently deploys less
+cash than intended and still looks like it worked.
+
+One wrinkle worth knowing: `save_list` immediately followed by `load_list` can fail. The
+reset restores $10,000, and if the book has appreciated past that, rebuying the same
+quantities costs more than the reset provides. That is the guard working, and the fix is to
+scale by the percentage it prints.
 
 ---
 

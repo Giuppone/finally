@@ -8,9 +8,9 @@ The key document is PLAN.md included in full below. Section 13 is a decision rec
 
 **All twelve sections of PLAN.md are implemented.** The app builds, runs in Docker and serves a working trading terminal at `http://localhost:8000`.
 
-- **Backend** (§6–§9): database + schema, the market-data package (three modes — see PLAN.md §13 item 9), SSE streaming, price cache with ring buffer, trading/portfolio/watchlist endpoints, portfolio-session save/load (`GET`/`POST /api/session`), the analytics package (`app/analytics/` — risk decomposition and rebalance suggestions, PORTFOLIO_ANALYTICS.md), 30s P&L snapshots, and the LLM chat package (`app/chat/`). `cd backend && uv run pytest -q` → **314 passed**.
+- **Backend** (§6–§9): database + schema, the market-data package (three modes — see PLAN.md §13 item 9), SSE streaming, price cache with ring buffer, trading/portfolio/watchlist endpoints, portfolio-session save/load (`GET`/`POST /api/session`), the analytics package (`app/analytics/` — risk decomposition and rebalance suggestions, PORTFOLIO_ANALYTICS.md), 30s P&L snapshots, and the LLM chat package (`app/chat/`). `cd backend && uv run pytest -q` → **373 passed**.
 - **Frontend** (§10): `frontend/` is a Next.js 16 + React 19 + Tailwind static export using **Recharts** as the single charting dependency — the open question in PLAN.md §13 "Still open" is now decided, because Recharts covers the line chart, the sparklines *and* the treemap, while Lightweight Charts has no treemap.
-- **Packaging** (§11, §12): multi-stage `Dockerfile`, `docker-compose.yml`, start/stop scripts for macOS and Windows, and a Playwright E2E suite in `test/` (**37 specs, all passing**).
+- **Packaging** (§11, §12): multi-stage `Dockerfile`, `docker-compose.yml`, start/stop scripts for macOS and Windows, and a Playwright E2E suite in `test/` (**38 specs, all passing**).
 
 Design notes from the deleted first pass are in `planning/archive/`; consult them only when required. The current design docs are `MARKET_DATA_DESIGN.md`, `MARKET_INTERFACE.md`, `MARKET_SIMULATOR.md` and `MASSIVE_API.md`. Code reviews live in `Back_end_review.md` and `Market_data_review.md` — the three findings open at the time of those reviews (reset not serialised, duplicate snapshot rows, `add_ticker` perturbing other GBM paths) were **fixed on 2026-08-15**, each with a regression test.
 
@@ -35,11 +35,12 @@ docker build -t finally . && docker run -d --name finally -p 8000:8000 --env-fil
 # Backend only — also serves frontend/out if it has been built
 cd backend
 uv run uvicorn app.main:app --port 8000      # needs env vars; see PLAN.md §5
-uv run pytest -q                             # 314 tests
+uv run pytest -q                             # 373 tests
 uv run market_data_demo.py                   # live terminal dashboard, simulator
+uv run python scripts/calibrate_market.py --dry-run   # recalibrate sigma/mu/rho from real bars
 uv run market_data_demo.py --live            # same, against the real Massive key
 
-# E2E against the real container, LLM_MOCK=true — 37 specs (close other containers first;
+# E2E against the real container, LLM_MOCK=true — 38 specs (close other containers first;
 # a second app instance competing for CPU roughly doubles the wall time)
 docker compose -f test/docker-compose.test.yml up --build --exit-code-from playwright
 ```
@@ -60,8 +61,12 @@ validation and snapshots apply exactly as they do for a human clicking Buy.
 # PowerShell (this machine) — .sh twins exist for Git Bash, macOS and CI
 .\scripts\equal_weight_portfolio.ps1 --yes           # equal DOLLAR weight = unequal RISK weight
 .\scripts\start_random_portfolio.ps1 --yes --seed 7  # reproducible, deliberately lopsided
-.\scripts\save_session.ps1 --name lopsided           # -> sessions\lopsided.json
-.\scripts\load_session.ps1 --name lopsided --yes     # exact restore, avg_cost and all
+.\scripts\save_session.ps1 --name lopsided          # -> sessions\lopsided.json (exact JSON)
+.\scripts\load_session.ps1 --name lopsided --yes    # exact restore, avg_cost and all
+
+.\scripts\import_broker.ps1                          # broker export -> suggestedroker.txt (weights)
+.\scripts\save_list.ps1 --name mine                 # -> suggested\mine.txt (TICKER QTY)
+.\scripts\load_list.ps1 --name mine --yes           # reset to $10k, buy those quantities
 ```
 
 Flags are the Python tool's, not PowerShell's — `--yes`, not `-Yes`. The wrappers deliberately have no
@@ -77,3 +82,30 @@ Windows cp1252 console cannot encode `≈` and crashed mid-run before that was f
 The backend reads `os.environ` only and never parses `.env` (§5), so load the file into the environment before launching or it starts in `SIMULATED`. It also **fails fast** at startup without `OPENROUTER_API_KEY` unless `LLM_MOCK=true`.
 
 @planning/PLAN.md
+## Market calibration (planning/MARKET_SIMULATOR.md §9)
+
+`backend/scripts/calibrate_market.py` pulls daily bars from Massive, computes sigma / damped
+mu / CAGR / pairwise correlations, and **regenerates `backend/app/market/seeds.py`**. That
+file is generated — hand edits are lost on the next run.
+
+```bash
+cd backend
+uv run python scripts/calibrate_market.py --dry-run      # what would change; fetches nothing
+uv run python scripts/calibrate_market.py --yes          # ~13s per uncached ticker
+uv run python scripts/calibrate_market.py --tickers COIN --yes   # one call, rest from cache
+```
+
+Raw closes are cached in `backend/calibration/bars.json` (~2 KB per ticker, committed), so
+adding a ticker costs one API call rather than twenty-six — a Basic key allows 5 per minute.
+Correlations need aligned series, so every parameter is recomputed over the date range common
+to all tickers.
+
+Two invariants worth not breaking:
+
+- **`mu` is damped from the realised LOG-drift, never from CAGR.** `CAGR = exp(drift) - 1`;
+  on this basket MU's drift is 2.02 against a CAGR of 6.39. CAGR is display-only — it appears
+  beside the damped figure in the risk panel so the damping is auditable.
+- **`sigma` is TOTAL volatility.** `simulator.diffusion_sigma()` subtracts the jump budget at
+  engine-build time; pre-subtracting during calibration removes it twice.
+
+Parameters load at import, so **the app must be restarted** for a recalibration to take effect.
