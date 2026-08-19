@@ -92,7 +92,7 @@ Install Python 3.9+, or start the container first:
         # Sessions are files, and inside the container the default sessions\ path resolves
         # to /sessions - ephemeral, and invisible from the host. The seeders are fine over
         # docker exec because they only talk HTTP; save and load are not.
-        if ($Command -in @("save", "load", "dump", "build", "broker")) {
+        if ($Command -in @("save", "load", "dump", "build", "broker", "ledger")) {
             Write-Error @"
 save/load need Python on the host: they read and write files under sessions\,
 and the container's filesystem is not the host's. Install Python 3.9+ (or run the

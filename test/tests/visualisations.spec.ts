@@ -29,6 +29,13 @@ test.describe("portfolio visualisations", () => {
   test("the P&L chart accumulates points after trades", async ({ page }) => {
     const chart = page.getByTestId("pnl-chart");
 
+    // Pin to LIVE first. The panel now opens on MAX, which draws the reconstructed daily
+    // curve from a committed artifact — that renders an area path whether or not a single
+    // snapshot was ever written, so asserting on it here would prove nothing about
+    // portfolio_snapshots, which is what this spec is for.
+    await page.getByTestId("pnl-range-live").click();
+    await expect(chart).toHaveAttribute("data-range", "live");
+
     await tradeViaBar(page, "SLV", 5, "buy");
 
     // TWO trades, a beat apart, on purpose. A snapshot is written immediately after every

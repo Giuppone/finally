@@ -330,3 +330,38 @@ def test_an_unrecognised_file_says_so_rather_than_returning_nothing() -> None:
     rows, warnings = portfolio_tool.parse_broker("this is not a broker export\n")
     assert rows == []
     assert any("right file" in warning for warning in warnings)
+
+
+# ---- the dated-ledger subcommands ---------------------------------------------
+
+def test_ledger_and_load_history_are_wired() -> None:
+    """Argparse wiring only - the reconstruction itself is covered in test_history_*.py."""
+    parser = portfolio_tool.build_parser()
+
+    ledger_args = parser.parse_args(["ledger", "--dry-run"])
+    assert ledger_args.func is portfolio_tool.cmd_ledger
+    assert ledger_args.dry_run is True
+    assert ledger_args.source == "compras-ventas-fechas"
+
+    history_args = parser.parse_args(["load_history", "--yes"])
+    assert history_args.func is portfolio_tool.cmd_load_history
+    assert history_args.yes is True
+
+
+def test_shared_flags_still_work_after_the_new_subcommands() -> None:
+    """The wrappers can only produce `<command> --flag`, never the other order."""
+    args = portfolio_tool.build_parser().parse_args(
+        ["ledger", "--base", "http://localhost:9000", "--json"])
+    assert args.base == "http://localhost:9000" and args.json is True
+
+
+def test_snapshot_date_defaults_to_the_last_date_in_the_ledger() -> None:
+    """The holdings export carries no date of its own, but it was pulled alongside the
+    ledger - and the never-traded-ticker ratio fallback needs a day to price against."""
+    text = (
+        "Fecha\tTipo\tTicker\tCantidad\tMoneda\tPrecio\tNeto\n"
+        "2026-01-12\tCompra\tMU\t4\tUSD\t200.0\t800.0\n"
+        "2026-08-10\tCompra\tTSM\t100\tARS\t70000.0\t7000000.0\n"
+    )
+    assert portfolio_tool._last_ledger_date(text) == "2026-08-10"
+    assert portfolio_tool._last_ledger_date("no dates here") == ""

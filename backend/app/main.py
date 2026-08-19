@@ -15,6 +15,7 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
 from . import analytics, chat, db, routes
+from .history.routes import router as history_router
 from .market import PriceCache, build_market_service
 from .market import router as market_router
 from .portfolio import SnapshotTask
@@ -59,6 +60,9 @@ app.include_router(market_router)
 app.include_router(routes.router)
 app.include_router(chat.router)
 app.include_router(analytics.router)
+# Not `history.router`: app/history/__init__.py deliberately does not re-export the router,
+# so that backend/scripts/portfolio_tool.py can import the package without FastAPI installed.
+app.include_router(history_router)
 
 
 @app.get("/api/health")

@@ -14,8 +14,11 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
-lib64/
+# Anchored to the repo root. Unanchored `lib/` also matches `frontend/lib/`, which is real
+# source - api.ts, types.ts, format.ts, derive.ts, useStream.ts, chart.ts - and it kept that
+# whole directory out of every commit, so a fresh clone could not build the frontend.
+/lib/
+/lib64/
 parts/
 sdist/
 var/
@@ -51,6 +54,7 @@ coverage.xml
 .pytest_cache/
 cover/
 
+
 # Translations
 *.mo
 *.pot
@@ -74,7 +78,7 @@ docs/_build/
 # PyBuilder
 .pybuilder/
 target/
-
+example/
 # Jupyter Notebook
 .ipynb_checkpoints
 
@@ -230,3 +234,16 @@ test-results/
 playwright-report/
 blob-report/
 playwright/.cache/
+
+# ---- personal financial data ------------------------------------------------------
+# Real brokerage exports, the dated transaction ledger, and everything derived from
+# them. These exist locally and are baked into locally-built Docker images (dockerignore,
+# not gitignore, controls the build context), but they must never enter git: this repo
+# has a public remote. A fresh clone simply has no evolution curve until its owner runs
+# scripts/import_broker_with_dates against their own export.
+/example/*
+!/example/.gitkeep
+/suggested/*
+!/suggested/.gitkeep
+/sessions/*.json
+backend/calibration/ledger.json

@@ -39,8 +39,21 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
+# `app/history/` holds the ledger parser and the CEDEAR reconstruction. The dependency runs
+# this way round - script imports app, never the reverse - because `pyproject.toml` has
+# `packages = ["app"]`, so `scripts/` is not in the wheel and an `app` -> `scripts` import
+# would resolve only by cwd accident. Every module under `app.history` is stdlib-only for
+# exactly this call site; see the note in `app/history/__init__.py`.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from app.history import ledger as history_ledger  # noqa: E402
+from app.history import bars as history_bars      # noqa: E402
+from app.history import reconstruct as history_reconstruct  # noqa: E402
+from app.history import session as history_session  # noqa: E402
+
 DEFAULT_BASE = f"http://localhost:{os.environ.get('FINALLY_PORT', '8000')}"
 DEFAULT_SESSION_DIR = Path(__file__).resolve().parents[2] / "sessions"
+# The raw broker exports the user drops in, as opposed to the lists this tool writes.
+DEFAULT_EXAMPLE_DIR = Path(__file__).resolve().parents[2] / "example"
 # Holdings lists live apart from the JSON sessions on purpose: a session is an exact,
 # machine-written round trip (cash and average costs included), a list is a handful of
 # quantities meant to be edited by hand.
@@ -755,6 +768,170 @@ def cmd_load(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_ledger(args: argparse.Namespace) -> int:
+    """Dated broker export + current holdings -> backend/calibration/ledger.json.
+
+    Text in, text out: no API call, and nothing written but that one file - the same shape as
+    `broker`. It is the whole reason the evolution chart can exist in a container: the raw
+    export lives in `example/`, which `.dockerignore` keeps out of the image, so the ledger has
+    to be reduced to a committed artifact under `backend/` first. Exactly the relationship
+    `calibrate_market.py` has with `app/market/seeds.py`.
+
+    Everything it prints is auditable before you commit the result, because every number in the
+    reconstruction is measured rather than assumed: the exchange rate off the bond conversion
+    rows, the CEDEAR ratios off the trades, the opening book off the holdings file.
+    """
+    source = Path(args.file) if args.file else DEFAULT_EXAMPLE_DIR / f"{args.source}.txt"
+    if not source.is_file():
+        raise ApiError(f"no dated broker export at {source}")
+    holdings_path = Path(args.holdings) if args.holdings else DEFAULT_LIST_DIR / "sugested.txt"
+    if not holdings_path.is_file():
+        raise ApiError(
+            f"no holdings export at {holdings_path} - the opening positions are back-solved "
+            f"against it, so the reconstruction cannot start without one"
+        )
+
+    rows, warnings = parse_broker(holdings_path.read_text(encoding="utf-8"))
+    for warning in warnings:
+        print(f"  ! {warning}")
+    if not rows:
+        raise ApiError(f"{holdings_path}: nothing parsed")
+    holdings = {
+        row.ticker: history_ledger.Holding(quantity=row.quantity, price_ars=row.price)
+        for row in rows
+    }
+
+    text = source.read_text(encoding="utf-8")
+    snapshot_date = args.as_of or _last_ledger_date(text)
+    document = history_ledger.build_document(
+        text, holdings, snapshot_date=snapshot_date, source=source.name)
+    for warning in document.warnings:
+        print(f"  ! {warning}")
+
+    bars = history_bars.load()
+    if not bars.tickers():
+        print("  ! no daily bars cached - run scripts/calibrate_market.py first, or the "
+              "curve will have nothing to price against")
+    result = history_reconstruct.build(document, bars)
+
+    print(f"\nparsed {source.name}: {len(document.rows)} trades, "
+          f"{len(document.ignored)} income rows ignored (dividends, coupons, amortisation)")
+
+    print(f"\n  ARS/USD, measured from {len(result.fx_points)} same-day conversion pairs:")
+    for when, rate in result.fx_points:
+        print(f"    {when}  {rate:>10,.1f}")
+
+    print(f"\n  {'TICKER':<8}{'RATIO':>9}  SOURCE     OPENING")
+    for ticker in result.priced:
+        print(f"  {ticker:<8}{result.ratios[ticker]:>9.2f}  "
+              f"{result.ratio_sources.get(ticker, '?'):<10} "
+              f"{document.opening.get(ticker, 0.0):>10,.0f}")
+    for ticker in result.carried:
+        print(f"  {ticker:<8}{'carried':>9}  {'-':<10} "
+              f"{document.opening.get(ticker, 0.0):>10,.0f}")
+
+    problems = history_reconstruct.reconcile(result, document)
+    print(f"\n  opening cash  ${result.opening_cash:>12,.2f}")
+    print(f"  opening carry ${result.opening_carry:>12,.2f}")
+    if result.points:
+        first, last = result.points[0], result.points[-1]
+        change = (last.total_value / first.total_value - 1) * 100 if first.total_value else 0.0
+        print(f"  curve         {first.day} ${first.total_value:,.0f}  ->  "
+              f"{last.day} ${last.total_value:,.0f}  ({change:+.1f}%, "
+              f"{len(result.points)} points)")
+    for warning in result.warnings:
+        print(f"  ! {warning}")
+
+    # The end-state check is the one that matters. Every step feeds the terminal position, so
+    # if the rate, the ratios, the openings and the calendar are all right this comes out
+    # exact - and if any of them is wrong this is usually the only place it shows.
+    if problems:
+        print(f"\n  RECONCILIATION FAILED on {len(problems)} of {len(result.priced)} tickers:")
+        for problem in problems:
+            print(f"    {problem}")
+    else:
+        print(f"\n  reconciled: all {len(result.priced)} priced tickers end exactly where the "
+              f"holdings file says they should")
+
+    if args.dry_run:
+        print("\n--dry-run: nothing written")
+        return 0
+
+    path = Path(args.out) if args.out else history_ledger.default_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(history_ledger.to_json(document), encoding="utf-8")
+    print(f"\nwrote {path}")
+    print("Restart the app to pick it up (the document is read at first request).")
+
+    if args.json:
+        print(json.dumps({
+            "path": str(path), "trades": len(document.rows),
+            "ignored": len(document.ignored), "fx": result.fx_points,
+            "ratios": result.ratios, "priced": result.priced, "carried": result.carried,
+            "opening_cash": result.opening_cash, "opening_carry": result.opening_carry,
+            "points": len(result.points), "reconciliation": problems,
+        }, indent=2))
+    return 0 if not problems else 1
+
+
+def _last_ledger_date(text: str) -> str:
+    """The most recent date in the export.
+
+    The holdings file has no date of its own, but it was pulled at the same time as the ledger,
+    and the snapshot ratio fallback needs a day to price against.
+    """
+    dates = re.findall(r"^\s*(\d{4}-\d{2}-\d{2})\t", text, flags=re.MULTILINE)
+    return max(dates) if dates else ""
+
+
+def cmd_load_history(args: argparse.Namespace) -> int:
+    """Write the reconstructed real book into the live portfolio.
+
+    Fetches the document from `GET /api/history/session` rather than recomputing it here, so
+    the reconstruction math lives in exactly one place instead of forking into a stdlib CLI
+    that would then drift from the curve the chart is drawing.
+
+    Posts to `/api/session` for the reason that endpoint exists: it is the only one that sets an
+    exact quantity AND an exact average cost. Replaying as market buys fills at today's price
+    and rewrites every cost basis.
+    """
+    api = Api(args.base)
+    wait_healthy(api)
+
+    payload = api.get("/api/history/session")
+    document = payload["session"]
+    dropped = payload.get("dropped", [])
+
+    print(f"reconstructed book as of {document['meta'].get('as_of')}: "
+          f"{len(document['positions'])} positions, cash ${document['cash_balance']:,.2f}")
+    print(f"\n  {'TICKER':<8}{'SHARES':>12}{'AVG COST':>12}")
+    for position in document["positions"]:
+        print(f"  {position['ticker']:<8}{position['quantity']:>12,.4f}"
+              f"{position['avg_cost']:>12,.2f}")
+    for entry in dropped:
+        print(f"  ! {entry['ticker']}: {entry['reason']}")
+    for warning in payload.get("warnings", []):
+        print(f"  ! {warning}")
+
+    if args.dry_run:
+        print("\n--dry-run: nothing written")
+        return 0
+
+    confirm("Replace the current portfolio with the reconstructed book? Positions, trades and "
+            "P&L history will be replaced (chat history is kept).", args.yes)
+
+    result = api.post("/api/session", document)
+    loaded = result["loaded"]
+    print(f"\nloaded {loaded['positions']} positions, {loaded['watchlist']} watched")
+    for ticker in result.get("unpriced", []):
+        print(f"  ! {ticker} has no live price yet - valued at cost until the next tick")
+
+    report(api)
+    if args.json:
+        print(json.dumps(result, indent=2))
+    return 0
+
+
 def _session_path(file: str | None, name: str) -> Path:
     return Path(file) if file else DEFAULT_SESSION_DIR / f"{name}.json"
 
@@ -850,6 +1027,31 @@ def build_parser() -> argparse.ArgumentParser:
     load_parser.add_argument("--file", help="explicit path")
     load_parser.add_argument("--name", default="default", help="session name")
     load_parser.set_defaults(func=cmd_load)
+
+    ledger_parser = sub.add_parser(
+        "ledger", help="dated broker export -> backend/calibration/ledger.json",
+        parents=[common])
+    ledger_parser.add_argument("--source", default="compras-ventas-fechas",
+                               help=f"export name under {DEFAULT_EXAMPLE_DIR} "
+                                    f"(default 'compras-ventas-fechas')")
+    ledger_parser.add_argument("--file", help="explicit path to the dated export")
+    ledger_parser.add_argument("--holdings",
+                               help=f"current-holdings export (default "
+                                    f"{DEFAULT_LIST_DIR / 'sugested.txt'})")
+    ledger_parser.add_argument("--out", help="explicit path for the generated document")
+    ledger_parser.add_argument("--as-of",
+                               help="date the holdings export was pulled (default: the "
+                                    "latest date in the ledger)")
+    ledger_parser.add_argument("--dry-run", action="store_true",
+                               help="print the reconstruction, write nothing")
+    ledger_parser.set_defaults(func=cmd_ledger)
+
+    history_parser = sub.add_parser(
+        "load_history", help="write the reconstructed real book into the live portfolio",
+        parents=[common])
+    history_parser.add_argument("--dry-run", action="store_true",
+                                help="print the book, send no writes")
+    history_parser.set_defaults(func=cmd_load_history)
 
     return parser
 

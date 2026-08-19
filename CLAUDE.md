@@ -82,6 +82,39 @@ Windows cp1252 console cannot encode `≈` and crashed mid-run before that was f
 The backend reads `os.environ` only and never parses `.env` (§5), so load the file into the environment before launching or it starts in `SIMULATED`. It also **fails fast** at startup without `OPENROUTER_API_KEY` unless `LLM_MOCK=true`.
 
 @planning/PLAN.md
+## Portfolio evolution (planning/PORTFOLIO_HISTORY.md)
+
+A dated transaction ledger (`example/compras-ventas-fechas.txt`) reconstructed as a daily USD
+equity curve, shown by the `LIVE 1M 3M 6M YTD MAX` strip on the P&L chart and the main chart. The
+P&L chart opens on `MAX` when a ledger is present.
+
+```powershell
+.\scripts\import_broker_with_dates.ps1 --dry-run   # print the reconstruction, write nothing
+.\scripts\import_broker_with_dates.ps1             # -> backend/calibration/ledger.json
+.\scripts\load_history.ps1 --dry-run               # print the book it would load
+.\scripts\load_history.ps1 --yes                   # adopt it as the live portfolio
+```
+
+`backend/calibration/ledger.json` is **generated and GITIGNORED** - it contains the real
+transaction history, so it never enters git; it reaches the container because `docker build`
+copies the local working tree (dockerignore, not gitignore, controls the build context). Same
+generated-artifact arrangement as `calibrate_market.py` -> `seeds.py`, minus the commit. A fresh
+clone simply has no evolution curve until its owner runs the importer against their own export.
+It stores
+inputs only; the exchange rate, the CEDEAR ratios and the curve are recomputed at startup, so a
+`bars.json` refresh extends the curve rather than leaving it frozen.
+
+Three things are measured from the file itself rather than looked up: the **ARS/USD rate** (from
+same-day bond conversion pairs), the **CEDEAR ratio** per ticker (`us_close / cedear_price_usd`,
+median), and the **opening book** (`current_holdings - net_ledger_flow`). The importer prints all
+three plus a reconciliation check that the walked positions end exactly where the holdings export
+says - that check is what catches a broken rate, ratio or calendar, so read it before committing.
+
+Unlike `import_broker`, this keeps real quantities. Instruments with no US daily closes (the
+Argentine bonds and local equities) are **carried at cost** and excluded from positions - not
+because they cannot be normalised, but because a name in `positions` joins `tracked_tickers` and
+the simulator would invent a GBM path for a stock with no US listing.
+
 ## Market calibration (planning/MARKET_SIMULATOR.md §9)
 
 `backend/scripts/calibrate_market.py` pulls daily bars from Massive, computes sigma / damped

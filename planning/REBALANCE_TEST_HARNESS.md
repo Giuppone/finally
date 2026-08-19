@@ -22,6 +22,8 @@ state repeatable across restarts and shareable as a file.
 | `scripts/import_broker.sh` / `.ps1` | wrapper → `portfolio_tool.py broker` (broker export → weights list) |
 | `scripts/save_list.sh` / `.ps1` | wrapper → `portfolio_tool.py dump` (editable list) |
 | `scripts/load_list.sh` / `.ps1` | wrapper → `portfolio_tool.py build` (editable list) |
+| `scripts/import_broker_with_dates.sh` / `.ps1` | wrapper → `portfolio_tool.py ledger` (dated export → `backend/calibration/ledger.json`) |
+| `scripts/load_history.sh` / `.ps1` | wrapper → `portfolio_tool.py load_history` (reconstructed real book → live portfolio) |
 | `suggested/` | where holdings lists live |
 | `backend/app/routes.py` | `GET /api/session`, `POST /api/session` (§6) |
 | `backend/app/db.py` | `import_session()` — the transactional restore |
@@ -300,13 +302,24 @@ balance *before the first order*: a rejection halfway through leaves a half-buil
 which is precisely what a list is supposed to prevent. The error names the shortfall and the
 percentage to scale by.
 
+### Importing a real brokerage account WITH dates
+
+`import_broker` below keeps only the proportions, because without dates the CEDEAR ratios are
+unknown. `import_broker_with_dates` reads a **dated** transaction export instead, and that changes
+the arithmetic entirely: the ratios become measurable (`us_close / cedear_price_usd`), the ARS/USD
+rate falls out of the same-day bond conversion rows, and the real book can be rebuilt day by day.
+`load_history` then restores it through `POST /api/session` with real cost bases.
+
+Full design in `planning/PORTFOLIO_HISTORY.md`. The rest of this section covers the
+proportions-only path, which is still the right tool when all you have is a holdings snapshot.
+
 ### Importing a real brokerage account
 
 `import_broker` reads an Argentine broker's holdings export and writes a weights list.
 
 **Weights, not share counts, and that is the whole design decision.** Those holdings are
 CEDEARs — certificates over a *fraction* of a US share, at a ratio that differs per stock,
-priced in pesos. 100 MU CEDEARs is not 100 MU shares, and a nine-figure-peso book is not a
+priced in pesos. 100 MU CEDEARs is not 100 MU shares, and a nine-figure peso book is not a
 $10,000 one. The share counts in that file are meaningless here in every respect but one:
 the proportions they represent. So the proportions are what carries over, and `load_list`
 sizes them against whatever cash it has.

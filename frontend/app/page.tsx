@@ -9,6 +9,7 @@ import { Heatmap } from "@/components/Heatmap";
 import { MainChart } from "@/components/MainChart";
 import { PnlChart } from "@/components/PnlChart";
 import { PositionsTable } from "@/components/PositionsTable";
+import type { ChartRange } from "@/components/RangeSelector";
 import { TradeBar } from "@/components/TradeBar";
 import { Watchlist } from "@/components/Watchlist";
 import * as api from "@/lib/api";
@@ -16,7 +17,10 @@ import { derivePortfolio } from "@/lib/derive";
 import { useStream } from "@/lib/useStream";
 import type {
   ChatMessage,
+  DailySeries,
+  HistoryRange,
   Portfolio,
+  PortfolioCurve,
   Side,
   SnapshotPoint,
   WatchlistEntry,
@@ -34,6 +38,15 @@ export default function Terminal() {
   const [startingCash, setStartingCash] = useState(10_000);
   const [selected, setSelected] = useState<string | null>(null);
 
+  // Daily history. Separate from `snapshots` above because it is a separate account: that is
+  // the $10,000 paper book, this is the real one reconstructed from the dated ledger.
+  const [curve, setCurve] = useState<PortfolioCurve | null>(null);
+  const [pnlRange, setPnlRange] = useState<ChartRange>("max");
+  const [basis, setBasis] = useState<"value" | "percent">("value");
+  const [daily, setDaily] = useState<DailySeries | null>(null);
+  const [chartRange, setChartRange] = useState<ChartRange>("live");
+  const [historyLoading, setHistoryLoading] = useState(false);
+
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [pending, setPending] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
@@ -48,6 +61,11 @@ export default function Terminal() {
 
   // Tickers already seeded from the API, so selecting a ticker twice does not refetch.
   const seeded = useRef<Set<string>>(new Set());
+  // Daily series are derived from a committed artifact and never change while the process
+  // lives, so they are fetched once per (key, range) and kept. Deliberately NOT on the 15s
+  // refresh interval below — re-fetching immutable data every 15 seconds is pure waste.
+  const curveCache = useRef<Map<string, PortfolioCurve>>(new Map());
+  const dailyCache = useRef<Map<string, DailySeries | null>>(new Map());
 
   const refreshWatchlist = useCallback(async () => {
     const data = await api.getWatchlist();
@@ -68,6 +86,44 @@ export default function Terminal() {
     setStartingCash(data.starting_cash);
   }, []);
 
+  const loadCurve = useCallback(async (range: HistoryRange) => {
+    const cached = curveCache.current.get(range);
+    if (cached) {
+      setCurve(cached);
+      return cached;
+    }
+    setHistoryLoading(true);
+    try {
+      const data = await api.getPortfolioCurve(range);
+      curveCache.current.set(range, data);
+      setCurve(data);
+      return data;
+    } finally {
+      setHistoryLoading(false);
+    }
+  }, []);
+
+  const loadDaily = useCallback(async (ticker: string, range: HistoryRange) => {
+    const key = `${ticker}:${range}`;
+    if (dailyCache.current.has(key)) {
+      setDaily(dailyCache.current.get(key) ?? null);
+      return;
+    }
+    setHistoryLoading(true);
+    try {
+      const data = await api.getDailyPrices(ticker, range);
+      dailyCache.current.set(key, data);
+      setDaily(data);
+    } catch {
+      // A 404 here is ordinary: a ticker added today has no daily bars. Cache the miss so
+      // selecting it repeatedly does not re-ask, and let MainChart hide the daily ranges.
+      dailyCache.current.set(key, null);
+      setDaily(null);
+    } finally {
+      setHistoryLoading(false);
+    }
+  }, []);
+
   // ---- initial load ---------------------------------------------------------
 
   useEffect(() => {
@@ -76,7 +132,20 @@ export default function Terminal() {
     (async () => {
       try {
         const tickers = await refreshWatchlist();
-        await Promise.all([refreshPortfolio(), refreshSnapshots()]);
+        await Promise.all([
+          refreshPortfolio(),
+          refreshSnapshots(),
+          // The evolution is what the user asked to see on load, so it is fetched with the
+          // first paint rather than on first interaction. Falls back to LIVE when the build
+          // carries no reconstructed ledger.
+          loadCurve("max")
+            .then((data) => {
+              if (!cancelled && !data.available) setPnlRange("live");
+            })
+            .catch(() => {
+              if (!cancelled) setPnlRange("live");
+            }),
+        ]);
 
         // One round trip seeds every sparkline, rather than N per-ticker calls (§8).
         const symbols = tickers.map((entry) => entry.ticker);
@@ -100,7 +169,7 @@ export default function Terminal() {
     return () => {
       cancelled = true;
     };
-  }, [refreshWatchlist, refreshPortfolio, refreshSnapshots, seedSeries]);
+  }, [refreshWatchlist, refreshPortfolio, refreshSnapshots, seedSeries, loadCurve]);
 
   useEffect(() => {
     const timer = setInterval(() => {
@@ -109,6 +178,22 @@ export default function Terminal() {
     }, REFRESH_MS);
     return () => clearInterval(timer);
   }, [refreshPortfolio, refreshSnapshots]);
+
+  // Re-fetch on a deliberate control change, following the AnalyticsPanel effect pattern.
+  useEffect(() => {
+    if (pnlRange === "live") return;
+    void loadCurve(pnlRange).catch(() => {});
+  }, [pnlRange, loadCurve]);
+
+  // Daily closes for the selected ticker. Fetched for the LIVE range too, because the range
+  // strip can only offer the daily options once we know whether this ticker has any bars.
+  useEffect(() => {
+    if (!selected) {
+      setDaily(null);
+      return;
+    }
+    void loadDaily(selected, chartRange === "live" ? "max" : chartRange).catch(() => {});
+  }, [selected, chartRange, loadDaily]);
 
   // Deeper history for whatever is in the main chart, fetched once per ticker.
   useEffect(() => {
@@ -235,11 +320,24 @@ export default function Terminal() {
             ticker={selected}
             points={selected ? (series[selected] ?? []) : []}
             quote={selected ? quotes[selected] : undefined}
+            daily={daily}
+            range={chartRange}
+            onRangeChange={setChartRange}
+            loading={historyLoading}
           />
 
           <div className="grid min-h-0 grid-cols-2 gap-2">
             <Heatmap positions={live?.positions ?? []} />
-            <PnlChart points={snapshots} startingCash={startingCash} />
+            <PnlChart
+              points={snapshots}
+              startingCash={startingCash}
+              curve={curve}
+              range={pnlRange}
+              onRangeChange={setPnlRange}
+              basis={basis}
+              onBasisChange={setBasis}
+              loading={historyLoading}
+            />
           </div>
 
           <PositionsTable

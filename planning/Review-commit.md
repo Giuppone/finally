@@ -2,30 +2,47 @@
 
 ## Findings
 
-### P2 — Do not leave a real brokerage export available to commit
+### P1 — Exclude raw brokerage exports from the Docker build context
 
-[`suggested/sugested.txt`](../suggested/sugested.txt) contains a real account's individual
-positions, quantities, prices, cost bases, P&L, and ARS market values. The repository's
-`.gitignore` does not exclude it (or equivalent local broker exports), so a normal `git add .`
-will publish this sensitive financial data. Remove or redact the export, use a synthetic fixture
-where a sample is needed, and add a scoped ignore rule for local broker-export files.
+[`example/compras-ventas-fechas.txt`](../example/compras-ventas-fechas.txt) is correctly
+ignored by [`.gitignore`](../.gitignore), but `example/` is not excluded by
+[`.dockerignore`](../.dockerignore). Every `docker build .` therefore sends this dated,
+account-specific trade export (as well as the other files in that directory) to the Docker
+daemon/build service. Add `example/` to `.dockerignore`, keeping only the reviewed generated
+`backend/calibration/ledger.json` in the image.
 
-### P3 — The converted-list summary describes holdings that are not in the list
+### P1 — Do not crash when every ledger row is a currency conversion
 
-[`suggested/broker.txt`](../suggested/broker.txt#L2) says it has 25 holdings and reports the
-full ARS [redacted] source total. However, line 8 explicitly drops `TGNO4`, and the file
-contains only 24 allocation rows (lines 15–38), whose weights are normalized over the remaining
-ARS 136,434,132.50. This makes the generated artifact internally misleading and can cause a
-reviewer to think a holding was included when it was excluded. Generate the header from the kept
-rows (and optionally state the source total separately), or adjust this committed output before
-shipping it.
+[`backend/app/history/reconstruct.py`](../backend/app/history/reconstruct.py#L248) derives the
+walk boundaries from `effective` after removing recognized conversion rows. A valid ledger that
+contains only an AL30 USD/ARS conversion and an opening US holding leaves `effective` empty, so
+`min()`/`max()` raise `ValueError` and both history endpoints return 500. Fall back to the
+ledger/snapshot dates (or return an unavailable reconstruction) when no non-conversion rows
+remain, and cover this document shape with a test.
+
+### P1 — Prevent stale history fetches from replacing the selected chart
+
+[`frontend/app/page.tsx`](../frontend/app/page.tsx#L89) writes each completed `loadDaily` and
+`loadCurve` request directly to the shared `daily`/`curve` state. There is no cancellation or
+request-key check. If a user selects A then B before A returns, A can overwrite B's chart while
+the header still says B; quick range changes can similarly show MAX data under a 1M label. Guard
+the state update with the active ticker/range (or abort superseded requests).
+
+### P2 — Malformed ledger data contradicts the documented graceful-degradation contract
+
+[`backend/app/history/routes.py`](../backend/app/history/routes.py#L98) lets JSON and
+`LedgerError` exceptions from `_compute()` propagate. This conflicts with the route's own claim
+that a malformed ledger should degrade the history panel rather than fail it; a malformed
+committed `ledger.json` makes `/api/history/portfolio` return 500. Catch parse/version errors,
+cache an unavailable reconstruction with a warning, and make `/session` return its documented
+`no_ledger` response. The current test explicitly expects the exception, so it preserves the
+failure instead of checking the advertised behavior.
 
 ## Verification
 
-- Inspected `git diff HEAD` and untracked files: one modified broker export and one generated
-  weights list.
-- Parsed the source with `portfolio_tool.parse_broker`: 25 rows, including one local `TGNO4`
-  position; 24 CEDEAR rows remain after the documented drop.
-- Summed the generated allocation rows: 100.002% (expected rounding drift from three-decimal
-  percentages).
-- `git diff --check HEAD` reports no whitespace errors.
+- Inspected `git diff HEAD`, all untracked files, and `git diff --check HEAD` (no whitespace
+  errors).
+- Ran `backend/.venv/Scripts/python.exe -m pytest -q`: **431 passed**.
+- Ran `backend/scripts/portfolio_tool.py ledger --dry-run --json`: the generated ledger
+  reconciles all 26 priced tickers and produces a 151-point curve.
+- Frontend production build could not run because Node/npm is unavailable in this environment.

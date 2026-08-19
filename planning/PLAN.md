@@ -312,6 +312,18 @@ Seed entries are bare exchange symbols — no company names, no punctuation — 
 | POST | `/api/analytics/rebalance` | Suggests target weights (`min_variance`, `risk_parity`, `max_sharpe`, `equal_weight`) and the ordered trades that reach them. **Suggests only — executes nothing** |
 | POST | `/api/portfolio/rebalance` | Executes a suggested trade list. The whole batch runs under one hold of the trade lock, so nothing interleaves between the sells and the buys. A partial batch is a valid outcome, per §9 |
 
+### Daily history
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/history/portfolio` | Daily USD value of the real book reconstructed from a dated CEDEAR ledger. `range=1m\|3m\|6m\|ytd\|max`. Carries `total_value` **and** `return_pct` rebased to the filtered window, so the $/% toggle is a field swap. Returns 200 with `available: false` when no ledger has been generated |
+| GET | `/api/history/prices?tickers=A,B` | Bulk daily closes; an unknown symbol yields `[]` rather than failing the batch |
+| GET | `/api/history/prices/{ticker}` | One ticker's daily closes — the main chart's non-LIVE ranges. 404 on an unknown symbol |
+| GET | `/api/history/session` | The reconstructed book as a `POST /api/session` document, for `load_history` |
+
+Separate from `/api/portfolio/history` and `/api/prices/{ticker}/history` on purpose: those serve
+the simulated $10,000 account at 30s granularity and the intraday ring buffer, this serves a
+different account at daily granularity from a committed artifact. See `PORTFOLIO_HISTORY.md` §8.
+
 ### Sessions
 | Method | Path | Description |
 |--------|------|-------------|
@@ -422,6 +434,7 @@ The frontend is a single-page application with a dense, terminal-inspired layout
 - **Positions table** — tabular view of all positions: ticker, quantity, avg cost, current price, unrealized P&L, % change
 - **Trade bar** — simple input area: ticker field, quantity field, buy button, sell button. Market orders, instant fill.
 - **Analytics drawer** — opened by the **Risk & Return** and **Suggest Rebalance** buttons on the positions header. Two tabs over one selection: a risk/return scatter with the portfolio marked, weight-vs-risk-share bars, and a current-vs-target rebalance preview with the ordered trade list and an explicit Apply. See `PORTFOLIO_ANALYTICS.md`
+- **Time-range strip** — `LIVE 1M 3M 6M YTD MAX` on both the P&L chart and the main chart, plus a `$`/`%` toggle on the former. `LIVE` keeps the snapshot and SSE behaviour above unchanged; the longer ranges draw daily closes from `/api/history/*`. The P&L chart opens on `MAX` when a reconstructed ledger is present, so the portfolio's evolution is what the page loads with. See `PORTFOLIO_HISTORY.md`
 - **AI chat panel** — docked/collapsible sidebar. Message input, scrolling conversation history, loading indicator while waiting for LLM response. Trade executions and watchlist changes shown inline as confirmations.
 - **Header** — portfolio total value (updating live), connection status indicator, cash balance
 
